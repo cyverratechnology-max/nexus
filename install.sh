@@ -78,7 +78,7 @@ else
     log ".env sudah ada, secret tidak diubah"
 fi
 
-log "Memasang Node.js 20 dan membuild dashboard"
+log "Memasang Node.js 20"
 if ! command -v node >/dev/null 2>&1 || [[ "$(node -p 'process.versions.node.split(".")[0]')" -lt 20 ]]; then
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
     apt-get install -y nodejs
@@ -89,7 +89,6 @@ if [[ -f package-lock.json ]]; then
 else
     npm install --no-audit --no-fund
 fi
-VITE_API_URL="" npm run build
 
 log "Membuild agent Linux dan Windows"
 cd "${INSTALL_DIR}"
@@ -97,6 +96,14 @@ mkdir -p bin
 unset GOOS GOARCH
 go build -o bin/cyverra-agent-linux-amd64 ./agent/cmd/agent
 GOOS=windows GOARCH=amd64 go build -o bin/cyverra-agent-windows-amd64.exe ./agent/cmd/agent
+mkdir -p frontend/public/downloads
+cp bin/cyverra-agent-linux-amd64 frontend/public/downloads/cyverra-agent-linux-amd64
+cp bin/cyverra-agent-windows-amd64.exe frontend/public/downloads/cyverra-agent-windows-amd64.exe
+chmod 0644 frontend/public/downloads/cyverra-agent-*
+
+log "Membuild dashboard"
+cd "${INSTALL_DIR}/frontend"
+VITE_API_URL="" npm run build
 
 log "Menyiapkan Nginx dan firewall"
 mkdir -p /etc/cyverra/ssl

@@ -49,8 +49,8 @@ log "Memvalidasi konfigurasi Compose"
 "${COMPOSE[@]}" config --quiet
 
 if [[ -d "frontend" && -f "frontend/package.json" ]]; then
-    log "Membuild dashboard"
-    (cd frontend && npm ci --no-audit --no-fund && VITE_API_URL="" npm run build)
+    log "Memasang dependency dashboard"
+    (cd frontend && npm ci --no-audit --no-fund)
 fi
 
 if command -v go >/dev/null 2>&1; then
@@ -59,7 +59,14 @@ if command -v go >/dev/null 2>&1; then
     unset GOOS GOARCH
     go build -o bin/cyverra-agent-linux-amd64 ./agent/cmd/agent
     GOOS=windows GOARCH=amd64 go build -o bin/cyverra-agent-windows-amd64.exe ./agent/cmd/agent
+    mkdir -p frontend/public/downloads
+    cp bin/cyverra-agent-linux-amd64 frontend/public/downloads/cyverra-agent-linux-amd64
+    cp bin/cyverra-agent-windows-amd64.exe frontend/public/downloads/cyverra-agent-windows-amd64.exe
+    chmod 0644 frontend/public/downloads/cyverra-agent-*
 fi
+
+log "Membuild dashboard"
+(cd frontend && VITE_API_URL="" npm run build)
 
 log "Menerapkan migration dan restart API"
 "${COMPOSE[@]}" up -d --build postgres api

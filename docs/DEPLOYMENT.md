@@ -15,6 +15,8 @@ sudo bash update.sh
 
 The update script does not recreate the PostgreSQL volume or overwrite `/etc/nginx` certificate configuration. It makes backups under `/var/backups/cyverra-nexus/<timestamp>`, preserves `.env`, rejects dirty Git worktrees, uses fast-forward-only pulls, and runs the existing migrations when the API starts. Review the migration and backup before production updates. Additive migrations are expected; destructive schema changes require a separately tested migration and rollback plan.
 
+The update also builds the native agents and publishes them at `/downloads/cyverra-agent-windows-amd64.exe` and `/downloads/cyverra-agent-linux-amd64`. These binaries are generated deployment artifacts and are ignored by Git. Users still need a one-time enrollment token from the dashboard.
+
 The Compose API image expects migration files at `backend/migrations` during its build/runtime layout. Put TLS termination, a WAF, and a reverse proxy in front of the API before exposing it. Use managed PostgreSQL, secret injection, backups, TLS, and separate object/metrics storage for production.
 
 ## Ubuntu 22.04 agent

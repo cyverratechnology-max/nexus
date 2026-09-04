@@ -40,6 +40,8 @@ sudo bash update.sh
 4. The device appears after enrollment, then sends heartbeat, inventory, and metrics every 30 seconds.
 5. Select the device for inventory details or open **Monitoring** for CPU and memory samples.
 
+The **Devices** view also provides downloads for the native Windows `.exe` and Linux amd64 agent. Downloading the binary is not enrollment: generate a one-time token, then run the command shown by the dashboard.
+
 ## Install on Ubuntu 22.04
 
 Copy the project to the server and run:
