@@ -2,6 +2,7 @@
 frontend/node_modules/
 frontend/dist/
 artifacts/
+bin/
 backend/bin/
 agent/bin/
 *.log

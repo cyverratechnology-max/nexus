@@ -2,4 +2,6 @@
 
 Enrollment tokens are single-use, hashed at rest, and expire after 24 hours. Device credentials are unique and hashed at rest. Human sessions are signed, expire after eight hours, and derive organization scope server-side. Device listing and enrollment-token creation enforce organization scope and role checks.
 
-This first vertical slice does not yet expose arbitrary command execution, remote terminal, file operations, remote desktop, software deployment, policy enforcement, or self-update. Those features must be added only with explicit authorization, timeout, audit, path validation, package/signature verification, and security tests. Never run this development configuration with public network access.
+Audited command execution is now available to platform administrators, organization administrators, and technicians. Commands are limited to 4096 characters, queued per device, executed by the enrolled agent with a 60-second timeout, and recorded in the command/audit tables. This is a privileged feature: do not expose the development configuration publicly, and add approval workflows and command allowlists before production use.
+
+Remote file transfer, interactive remote terminal, remote desktop, software deployment, policy enforcement, and self-update are not complete. They must be added only with explicit authorization, path validation, streaming limits, package/signature verification, session termination, and security tests.

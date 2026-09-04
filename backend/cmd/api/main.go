@@ -54,6 +54,22 @@ type networkEntry struct {
 	MAC  string   `json:"mac"`
 	IPs  []string `json:"ips"`
 }
+type metricsRequest struct {
+	CPUPercent       *float64 `json:"cpu_percent"`
+	MemoryUsedBytes  *uint64  `json:"memory_used_bytes"`
+	MemoryTotalBytes *uint64  `json:"memory_total_bytes"`
+}
+type commandRequest struct {
+	Command string `json:"command"`
+}
+type commandResult struct {
+	ID       string `json:"id"`
+	Command  string `json:"command,omitempty"`
+	Status   string `json:"status"`
+	ExitCode *int   `json:"exit_code,omitempty"`
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+}
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -87,6 +103,13 @@ func main() {
 	mux.HandleFunc("POST /api/v1/agent/heartbeat", s.agentHeartbeat)
 	mux.HandleFunc("POST /api/v1/agent/inventory", s.agentInventory)
 	mux.HandleFunc("GET /api/v1/devices/{id}/inventory", s.requireUser(s.deviceInventory))
+	mux.HandleFunc("GET /api/v1/monitoring/summary", s.requireUser(s.monitoringSummary))
+	mux.HandleFunc("GET /api/v1/devices/{id}/metrics", s.requireUser(s.deviceMetrics))
+	mux.HandleFunc("POST /api/v1/agent/metrics", s.agentMetrics)
+	mux.HandleFunc("POST /api/v1/devices/{id}/commands", s.requireUser(s.createCommand))
+	mux.HandleFunc("GET /api/v1/agent/commands", s.agentCommands)
+	mux.HandleFunc("POST /api/v1/agent/commands/{id}/result", s.agentCommandResult)
+	mux.HandleFunc("GET /api/v1/devices/{id}/commands", s.requireUser(s.listCommands))
 	handler := s.cors(s.requestID(mux))
 	addr := env("API_ADDR", ":8080")
 	logger.Info("api listening", "addr", addr)
@@ -306,6 +329,177 @@ func (s *server) deviceInventory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"device_id": id, "data": decoded})
+}
+func (s *server) agentMetrics(w http.ResponseWriter, r *http.Request) {
+	var req metricsRequest
+	if !decode(r, &req) {
+		writeError(w, 400, "invalid metrics")
+		return
+	}
+	credential := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	var id string
+	if err := s.db.QueryRow(r.Context(), "SELECT id FROM devices WHERE credential_hash=$1", hash(credential)).Scan(&id); err != nil {
+		writeError(w, 401, "invalid device credential")
+		return
+	}
+	_, err := s.db.Exec(r.Context(), "INSERT INTO device_metrics (device_id, cpu_percent, memory_used_bytes, memory_total_bytes) VALUES ($1,$2,$3,$4)", id, req.CPUPercent, req.MemoryUsedBytes, req.MemoryTotalBytes)
+	if err != nil {
+		writeError(w, 500, "unable to store metrics")
+		return
+	}
+	writeJSON(w, 202, map[string]string{"device_id": id, "status": "accepted"})
+}
+func (s *server) monitoringSummary(w http.ResponseWriter, r *http.Request) {
+	a := r.Context().Value(authContextKey).(auth)
+	rows, err := s.db.Query(r.Context(), `SELECT d.id, d.hostname, d.status, m.cpu_percent, m.memory_used_bytes, m.memory_total_bytes, m.collected_at FROM devices d LEFT JOIN LATERAL (SELECT cpu_percent, memory_used_bytes, memory_total_bytes, collected_at FROM device_metrics WHERE device_id=d.id ORDER BY collected_at DESC LIMIT 1) m ON true WHERE d.organization_id=$1 AND d.status <> 'RETIRED' ORDER BY d.hostname`, a.OrganizationID)
+	if err != nil {
+		writeError(w, 500, "unable to load monitoring data")
+		return
+	}
+	defer rows.Close()
+	result := []map[string]any{}
+	for rows.Next() {
+		var id, hostname, status string
+		var cpu, memoryUsed, memoryTotal sql.NullFloat64
+		var collected sql.NullTime
+		if err := rows.Scan(&id, &hostname, &status, &cpu, &memoryUsed, &memoryTotal, &collected); err != nil {
+			writeError(w, 500, "unable to read monitoring data")
+			return
+		}
+		item := map[string]any{"device_id": id, "hostname": hostname, "status": status}
+		if cpu.Valid {
+			item["cpu_percent"] = cpu.Float64
+		}
+		if memoryUsed.Valid {
+			item["memory_used_bytes"] = memoryUsed.Float64
+		}
+		if memoryTotal.Valid {
+			item["memory_total_bytes"] = memoryTotal.Float64
+		}
+		if collected.Valid {
+			item["collected_at"] = collected.Time
+		}
+		result = append(result, item)
+	}
+	writeJSON(w, 200, map[string]any{"data": result})
+}
+func (s *server) deviceMetrics(w http.ResponseWriter, r *http.Request) {
+	a := r.Context().Value(authContextKey).(auth)
+	rows, err := s.db.Query(r.Context(), `SELECT m.cpu_percent, m.memory_used_bytes, m.memory_total_bytes, m.collected_at FROM device_metrics m JOIN devices d ON d.id=m.device_id WHERE m.device_id=$1 AND d.organization_id=$2 ORDER BY m.collected_at DESC LIMIT 60`, r.PathValue("id"), a.OrganizationID)
+	if err != nil {
+		writeError(w, 500, "unable to load device metrics")
+		return
+	}
+	defer rows.Close()
+	result := []map[string]any{}
+	for rows.Next() {
+		var cpu, used, total sql.NullFloat64
+		var collected time.Time
+		if err := rows.Scan(&cpu, &used, &total, &collected); err != nil {
+			writeError(w, 500, "unable to read device metrics")
+			return
+		}
+		item := map[string]any{"collected_at": collected}
+		if cpu.Valid {
+			item["cpu_percent"] = cpu.Float64
+		}
+		if used.Valid {
+			item["memory_used_bytes"] = used.Float64
+		}
+		if total.Valid {
+			item["memory_total_bytes"] = total.Float64
+		}
+		result = append(result, item)
+	}
+	writeJSON(w, 200, map[string]any{"data": result})
+}
+func (s *server) createCommand(w http.ResponseWriter, r *http.Request) {
+	a := r.Context().Value(authContextKey).(auth)
+	if a.Role != "platform_admin" && a.Role != "org_admin" && a.Role != "technician" {
+		writeError(w, 403, "insufficient permission")
+		return
+	}
+	var req commandRequest
+	if !decode(r, &req) || strings.TrimSpace(req.Command) == "" || len(req.Command) > 4096 {
+		writeError(w, 400, "command must be between 1 and 4096 characters")
+		return
+	}
+	var id string
+	err := s.db.QueryRow(r.Context(), `INSERT INTO commands (organization_id, device_id, user_id, command) SELECT $1, id, $2, $3 FROM devices WHERE id=$4 AND organization_id=$1 RETURNING id`, a.OrganizationID, a.UserID, req.Command, r.PathValue("id")).Scan(&id)
+	if err != nil {
+		writeError(w, 404, "device not found")
+		return
+	}
+	_, _ = s.db.Exec(r.Context(), `INSERT INTO audit_logs (organization_id,user_id,device_id,action,resource,metadata) VALUES ($1,$2,$3,'command.created','command',jsonb_build_object('command_id',$4))`, a.OrganizationID, a.UserID, r.PathValue("id"), id)
+	writeJSON(w, 202, map[string]string{"command_id": id, "status": "QUEUED"})
+}
+func (s *server) agentCommands(w http.ResponseWriter, r *http.Request) {
+	credential := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	var deviceID string
+	if err := s.db.QueryRow(r.Context(), "SELECT id FROM devices WHERE credential_hash=$1", hash(credential)).Scan(&deviceID); err != nil {
+		writeError(w, 401, "invalid device credential")
+		return
+	}
+	rows, err := s.db.Query(r.Context(), `UPDATE commands SET status='RUNNING', started_at=now() WHERE id=(SELECT id FROM commands WHERE device_id=$1 AND status='QUEUED' ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING id, status, exit_code, stdout, stderr`, deviceID)
+	if err != nil {
+		writeError(w, 500, "unable to load commands")
+		return
+	}
+	defer rows.Close()
+	if rows.Next() {
+		var result commandResult
+		if err := rows.Scan(&result.ID, &result.Command, &result.Status, &result.ExitCode, &result.Stdout, &result.Stderr); err != nil {
+			writeError(w, 500, "unable to read command")
+			return
+		}
+		writeJSON(w, 200, result)
+		return
+	}
+	writeJSON(w, 204, nil)
+}
+func (s *server) agentCommandResult(w http.ResponseWriter, r *http.Request) {
+	credential := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	var deviceID string
+	if err := s.db.QueryRow(r.Context(), "SELECT id FROM devices WHERE credential_hash=$1", hash(credential)).Scan(&deviceID); err != nil {
+		writeError(w, 401, "invalid device credential")
+		return
+	}
+	var req commandResult
+	if !decode(r, &req) || req.Status == "" {
+		writeError(w, 400, "invalid command result")
+		return
+	}
+	result, err := s.db.Exec(r.Context(), `UPDATE commands SET status=$1, exit_code=$2, stdout=$3, stderr=$4, completed_at=now() WHERE id=$5 AND device_id=$6 AND status='RUNNING'`, req.Status, req.ExitCode, req.Stdout, req.Stderr, r.PathValue("id"), deviceID)
+	if err != nil || result.RowsAffected() != 1 {
+		writeError(w, 404, "command not found")
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "accepted"})
+}
+func (s *server) listCommands(w http.ResponseWriter, r *http.Request) {
+	a := r.Context().Value(authContextKey).(auth)
+	rows, err := s.db.Query(r.Context(), `SELECT c.id,c.status,c.exit_code,c.stdout,c.stderr,c.created_at FROM commands c WHERE c.device_id=$1 AND c.organization_id=$2 ORDER BY c.created_at DESC LIMIT 50`, r.PathValue("id"), a.OrganizationID)
+	if err != nil {
+		writeError(w, 500, "unable to list commands")
+		return
+	}
+	defer rows.Close()
+	result := []map[string]any{}
+	for rows.Next() {
+		var id, status, stdout, stderr string
+		var code sql.NullInt32
+		var created time.Time
+		if err := rows.Scan(&id, &status, &code, &stdout, &stderr, &created); err != nil {
+			writeError(w, 500, "unable to read commands")
+			return
+		}
+		item := map[string]any{"id": id, "status": status, "stdout": stdout, "stderr": stderr, "created_at": created}
+		if code.Valid {
+			item["exit_code"] = code.Int32
+		}
+		result = append(result, item)
+	}
+	writeJSON(w, 200, map[string]any{"data": result})
 }
 
 func (s *server) sign(a auth) string {
