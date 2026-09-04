@@ -4,7 +4,12 @@ set -Eeuo pipefail
 APP_DIR="${APP_DIR:-/opt/cyverra-nexus}"
 SECRET_FILE="/etc/cyverra/webhook.env"
 [[ "${EUID}" -eq 0 ]] || { echo 'Run with sudo.' >&2; exit 1; }
-[[ -x "${APP_DIR}/bin/cyverra-webhook" ]] || { echo "Missing ${APP_DIR}/bin/cyverra-webhook" >&2; exit 1; }
+if [[ ! -x "${APP_DIR}/bin/cyverra-webhook" ]]; then
+    command -v go >/dev/null 2>&1 || { echo "Missing ${APP_DIR}/bin/cyverra-webhook and Go is not installed." >&2; exit 1; }
+    install -d -m 755 "${APP_DIR}/bin"
+    (cd "${APP_DIR}/deployments/webhook" && go build -o "${APP_DIR}/bin/cyverra-webhook" .)
+    chmod 0755 "${APP_DIR}/bin/cyverra-webhook"
+fi
 if [[ ! -f "${SECRET_FILE}" ]]; then
     install -d -m 700 /etc/cyverra
     cat > "${SECRET_FILE}" <<'EOF'
