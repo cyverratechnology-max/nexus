@@ -23,4 +23,8 @@ The Compose API image expects migration files at `backend/migrations` during its
 
 ## Ubuntu 22.04 agent
 
-Install the Linux binary at `/usr/local/bin/cyverra-agent`, create `/etc/cyverra/agent.env` with `CYVERRA_API_URL=https://your-api-host` and a single-use `CYVERRA_ENROLLMENT_TOKEN`, restrict that file to root (`chmod 600`), copy `deployments/systemd/cyverra-agent.service` to `/etc/systemd/system/`, then run `systemctl daemon-reload && systemctl enable --now cyverra-agent`. The unit stores its credential under `/var/lib/cyverra` and restarts after transient failures.
+Install the Linux binary at `/usr/local/bin/cyverra-agent`, then run `sudo bash deployments/systemd/install-agent.sh https://your-api-host ONE_TIME_TOKEN /usr/local/bin/cyverra-agent`. The script enrolls once, stores the credential under `/var/lib/cyverra`, and installs/enables the systemd service. The token is not kept in the service unit. The service restarts after transient failures.
+
+## Windows background service
+
+Open PowerShell as Administrator in the folder containing the downloaded `.exe` and `install-agent.ps1`, then run `Set-ExecutionPolicy -Scope Process Bypass` followed by `./install-agent.ps1 -ApiUrl https://your-api-host -EnrollmentToken ONE_TIME_TOKEN -AgentPath ./cyverra-agent-windows-amd64.exe`. The script enrolls once and installs the `CyverraNexusAgent` Windows service with automatic startup. Logs are stored under `C:\ProgramData\Cyverra\Agent\agent.json.log`.

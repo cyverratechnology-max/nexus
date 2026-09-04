@@ -69,6 +69,9 @@ func main() {
 	state := flag.String("state", defaultStatePath(), "agent state file")
 	once := flag.Bool("once", false, "send one heartbeat and exit")
 	flag.Parse()
+	if err := os.MkdirAll(filepath.Dir(*state), 0700); err != nil {
+		fatal("cannot create state directory: " + err.Error())
+	}
 	logPath := *state + ".log"
 	logFile, logErr := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if logErr == nil {

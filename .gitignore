@@ -3,6 +3,8 @@ frontend/node_modules/
 frontend/dist/
 frontend/public/downloads/cyverra-agent-*
 frontend/public/downloads/agent-manifest.json
+frontend/public/downloads/install-agent.ps1
+frontend/public/downloads/install-agent.sh
 artifacts/
 bin/
 backend/bin/
