@@ -30,7 +30,7 @@ cd /opt/cyverra-nexus
 sudo bash update.sh
 ```
 
-`update.sh` refuses to continue with uncommitted local changes, creates a timestamped `.env` and PostgreSQL backup, pulls with `git pull --ff-only`, validates Compose, builds the dashboard/agents, applies migrations through the API startup, restarts services, and checks `/health`.
+`update.sh` refuses to continue with uncommitted local changes and prints the files causing the refusal. It creates a timestamped `.env` and PostgreSQL backup, pulls with `git pull --ff-only`, validates Compose, installs the locked frontend dependencies with `npm ci`, builds the dashboard/agents, applies migrations through the API startup, restarts services, and checks `/health`.
 
 ## Add a device
 

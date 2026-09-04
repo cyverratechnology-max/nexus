@@ -26,7 +26,9 @@ cp -p "${ENV_FILE}" "${BACKUP_DIR}/.env"
 log "Memeriksa repository"
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "${APP_DIR} bukan Git repository."
 if [[ -n "$(git status --porcelain)" ]]; then
-    fail "Working tree memiliki perubahan lokal. Commit/stash dahulu agar update tidak menimpa perubahan."
+    log "File yang membuat working tree kotor:"
+    git status --short --untracked-files=all
+    fail "Working tree memiliki perubahan lokal. Commit/stash/restore file tersebut dahulu agar update tidak menimpa perubahan."
 fi
 OLD_COMMIT="$(git rev-parse HEAD)"
 printf '%s\n' "${OLD_COMMIT}" > "${BACKUP_DIR}/previous-commit"
@@ -48,7 +50,7 @@ log "Memvalidasi konfigurasi Compose"
 
 if [[ -d "frontend" && -f "frontend/package.json" ]]; then
     log "Membuild dashboard"
-    (cd frontend && npm install --no-audit --no-fund && VITE_API_URL="" npm run build)
+    (cd frontend && npm ci --no-audit --no-fund && VITE_API_URL="" npm run build)
 fi
 
 if command -v go >/dev/null 2>&1; then

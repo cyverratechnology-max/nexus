@@ -84,7 +84,11 @@ if ! command -v node >/dev/null 2>&1 || [[ "$(node -p 'process.versions.node.spl
     apt-get install -y nodejs
 fi
 cd "${INSTALL_DIR}/frontend"
-npm install --no-audit --no-fund
+if [[ -f package-lock.json ]]; then
+    npm ci --no-audit --no-fund
+else
+    npm install --no-audit --no-fund
+fi
 VITE_API_URL="" npm run build
 
 log "Membuild agent Linux dan Windows"
