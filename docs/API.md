@@ -25,3 +25,5 @@ Base path: `/api/v1`. JSON errors use `{ "error": { "message": "..." } }`.
 `GET /devices/{id}/metrics` and `GET /devices/{id}/inventory` require a human session and enforce organization ownership server-side.
 
 `POST /devices/{id}/commands` queues an audited command for a device. Only platform administrators, organization administrators, and technicians may create commands. The agent polls `GET /agent/commands`, executes one command with a 60-second timeout using the host shell, and posts the result to `POST /agent/commands/{id}/result`.
+
+`POST /devices/{id}/remote-sessions` creates an organization-scoped, audited `WEBRTC` session request with a 30-minute expiry. `GET /devices/{id}/remote-sessions` lists recent sessions and `POST /remote-sessions/{id}/close` closes an active/requested session. `STUN_URL` and `TURN_URL` are read from server environment configuration for the future signaling gateway.

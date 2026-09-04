@@ -70,6 +70,9 @@ type commandResult struct {
 	Stdout   string `json:"stdout"`
 	Stderr   string `json:"stderr"`
 }
+type remoteSessionRequest struct {
+	Protocol string `json:"protocol"`
+}
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -110,6 +113,9 @@ func main() {
 	mux.HandleFunc("GET /api/v1/agent/commands", s.agentCommands)
 	mux.HandleFunc("POST /api/v1/agent/commands/{id}/result", s.agentCommandResult)
 	mux.HandleFunc("GET /api/v1/devices/{id}/commands", s.requireUser(s.listCommands))
+	mux.HandleFunc("POST /api/v1/devices/{id}/remote-sessions", s.requireUser(s.createRemoteSession))
+	mux.HandleFunc("GET /api/v1/devices/{id}/remote-sessions", s.requireUser(s.listRemoteSessions))
+	mux.HandleFunc("POST /api/v1/remote-sessions/{id}/close", s.requireUser(s.closeRemoteSession))
 	handler := s.cors(s.requestID(mux))
 	addr := env("API_ADDR", ":8080")
 	logger.Info("api listening", "addr", addr)
@@ -500,6 +506,74 @@ func (s *server) listCommands(w http.ResponseWriter, r *http.Request) {
 		result = append(result, item)
 	}
 	writeJSON(w, 200, map[string]any{"data": result})
+}
+func (s *server) createRemoteSession(w http.ResponseWriter, r *http.Request) {
+	a := r.Context().Value(authContextKey).(auth)
+	if a.Role != "platform_admin" && a.Role != "org_admin" && a.Role != "technician" {
+		writeError(w, 403, "insufficient permission")
+		return
+	}
+	var req remoteSessionRequest
+	if !decode(r, &req) {
+		req.Protocol = "WEBRTC"
+	}
+	if req.Protocol != "WEBRTC" {
+		writeError(w, 400, "only WEBRTC sessions are supported")
+		return
+	}
+	var id string
+	err := s.db.QueryRow(r.Context(), `INSERT INTO remote_sessions (organization_id,device_id,user_id,protocol,stun_url,turn_url) SELECT $1,id,$2,$3,$4,$5 FROM devices WHERE id=$6 AND organization_id=$1 AND status <> 'RETIRED' RETURNING id`, a.OrganizationID, a.UserID, req.Protocol, os.Getenv("STUN_URL"), os.Getenv("TURN_URL"), r.PathValue("id")).Scan(&id)
+	if err != nil {
+		writeError(w, 404, "device not found")
+		return
+	}
+	_, _ = s.db.Exec(r.Context(), `INSERT INTO audit_logs (organization_id,user_id,device_id,action,resource,metadata) VALUES ($1,$2,$3,'remote.session.requested','remote_session',jsonb_build_object('session_id',$4))`, a.OrganizationID, a.UserID, r.PathValue("id"), id)
+	writeJSON(w, 202, map[string]any{"session_id": id, "status": "REQUESTED", "protocol": req.Protocol, "expires_in_seconds": 1800})
+}
+func (s *server) listRemoteSessions(w http.ResponseWriter, r *http.Request) {
+	a := r.Context().Value(authContextKey).(auth)
+	rows, err := s.db.Query(r.Context(), `SELECT id,status,protocol,created_at,expires_at,started_at,closed_at,close_reason FROM remote_sessions WHERE device_id=$1 AND organization_id=$2 ORDER BY created_at DESC LIMIT 20`, r.PathValue("id"), a.OrganizationID)
+	if err != nil {
+		writeError(w, 500, "unable to list remote sessions")
+		return
+	}
+	defer rows.Close()
+	result := []map[string]any{}
+	for rows.Next() {
+		var id, status, protocol string
+		var created, expires time.Time
+		var started, closed sql.NullTime
+		var reason sql.NullString
+		if err := rows.Scan(&id, &status, &protocol, &created, &expires, &started, &closed, &reason); err != nil {
+			writeError(w, 500, "unable to read remote sessions")
+			return
+		}
+		item := map[string]any{"id": id, "status": status, "protocol": protocol, "created_at": created, "expires_at": expires}
+		if started.Valid {
+			item["started_at"] = started.Time
+		}
+		if closed.Valid {
+			item["closed_at"] = closed.Time
+		}
+		if reason.Valid {
+			item["close_reason"] = reason.String
+		}
+		result = append(result, item)
+	}
+	writeJSON(w, 200, map[string]any{"data": result})
+}
+func (s *server) closeRemoteSession(w http.ResponseWriter, r *http.Request) {
+	a := r.Context().Value(authContextKey).(auth)
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	_ = decode(r, &req)
+	result, err := s.db.Exec(r.Context(), `UPDATE remote_sessions SET status='CLOSED', closed_at=now(), close_reason=$1 WHERE id=$2 AND organization_id=$3 AND status IN ('REQUESTED','APPROVED','CONNECTING','ACTIVE')`, req.Reason, r.PathValue("id"), a.OrganizationID)
+	if err != nil || result.RowsAffected() != 1 {
+		writeError(w, 404, "remote session not found or already closed")
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "CLOSED"})
 }
 
 func (s *server) sign(a auth) string {

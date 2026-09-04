@@ -10,6 +10,7 @@ Cyverra Nexus is being bootstrapped as a multi-tenant UEM, RMM, monitoring, auto
 - React/Vite dashboard for device visibility and enrollment-token creation.
 - Interactive Devices and Monitoring views with inventory details and live metric refresh.
 - Disk/SSD, installed software, running service inventory, and audited remote commands.
+- Audited remote desktop session lifecycle foundation with WebRTC/STUN/TURN configuration hooks.
 
 ## Run locally
 
