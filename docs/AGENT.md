@@ -5,3 +5,5 @@ The native Go agent runs without a language runtime on the endpoint. First run r
 The agent checks `/downloads/agent-manifest.json` at startup and every heartbeat cycle. When a newer semantic version is available, it downloads the platform binary, verifies the published SHA-256, stages it, and restarts. Linux replaces the executable atomically; Windows uses a temporary `.cmd` helper because Windows locks the running executable. If download, checksum, or replacement fails, the current agent continues running.
 
 Build with `go build -o bin/cyverra-agent ./agent/cmd/agent`. Windows service and Linux systemd wrappers should invoke the binary with a managed state path and an installer-provided enrollment token. Credentials must never be passed in shell history in production installers.
+
+On Windows, do not double-click the `.exe` for first enrollment because the console closes after a missing-token error. Open PowerShell in the download folder and run the command shown by the dashboard. Startup and fatal diagnostics are written beside the state file; the default log is `%AppData%\\cyverra\\agent.json.log`.

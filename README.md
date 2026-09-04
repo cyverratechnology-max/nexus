@@ -40,7 +40,7 @@ sudo bash update.sh
 4. The device appears after enrollment, then sends heartbeat, inventory, and metrics every 30 seconds.
 5. Select the device for inventory details or open **Monitoring** for CPU and memory samples.
 
-The **Devices** view also provides downloads for the native Windows `.exe` and Linux amd64 agent. Downloading the binary is not enrollment: generate a one-time token, then run the command shown by the dashboard.
+The **Devices** view also provides downloads for the native Windows `.exe` and Linux amd64 agent. Downloading the binary is not enrollment: generate a one-time token, then run the command shown by the dashboard. For Windows first run, open PowerShell in the download folder instead of double-clicking the executable; diagnostics are written to `%AppData%\\cyverra\\agent.json.log`.
 
 Agents check the published version manifest automatically. To release an agent update, change `agentVersion` in `agent/cmd/agent/main.go`, then run `sudo bash update.sh` on the server. The update script rebuilds both binaries, regenerates their SHA-256 manifest, and publishes it with the dashboard.
 

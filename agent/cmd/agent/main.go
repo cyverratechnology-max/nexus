@@ -22,6 +22,8 @@ import (
 
 const agentVersion = "0.2.0"
 
+var logMessage = func(message string) { fmt.Fprintln(os.Stderr, message) }
+
 type config struct{ Token, API, Credential string }
 type enrollRequest struct{ Token, Hostname, DeviceUUID, Platform, OSName, Architecture, AgentVersion string }
 type enrollResponse struct{ DeviceID, Credential string }
@@ -67,6 +69,16 @@ func main() {
 	state := flag.String("state", defaultStatePath(), "agent state file")
 	once := flag.Bool("once", false, "send one heartbeat and exit")
 	flag.Parse()
+	logPath := *state + ".log"
+	logFile, logErr := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if logErr == nil {
+		defer logFile.Close()
+		logMessage = func(message string) {
+			timestamped := time.Now().Format(time.RFC3339) + " " + message + "\n"
+			_, _ = logFile.WriteString(timestamped)
+			fmt.Fprint(os.Stderr, timestamped)
+		}
+	}
 	cfg := config{API: strings.TrimRight(*api, "/")}
 	if data, err := os.ReadFile(*state); err == nil {
 		_ = json.Unmarshal(data, &cfg)
@@ -74,7 +86,7 @@ func main() {
 	cfg.API = strings.TrimRight(*api, "/")
 	if cfg.Credential == "" {
 		if *token == "" {
-			fatal("enrollment token is required for first run")
+			fatal("enrollment token is required for first run; use --enrollment-token or CYVERRA_ENROLLMENT_TOKEN")
 		}
 		cfg.Credential = enroll(cfg.API, *token, *state)
 	}
@@ -173,7 +185,8 @@ func newerVersion(candidate, current string) bool {
 	return false
 }
 func download(url string) ([]byte, error) {
-	result, err := http.Get(url)
+	client := &http.Client{Timeout: 30 * time.Second}
+	result, err := client.Get(url)
 	if err != nil {
 		return nil, err
 	}
@@ -238,7 +251,8 @@ func get(url, credential string, response any) error {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+credential)
-	result, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: 30 * time.Second}
+	result, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -509,4 +523,4 @@ func defaultStatePath() string {
 	}
 	return ".cyverra-agent.json"
 }
-func fatal(message string) { fmt.Fprintln(os.Stderr, message); os.Exit(1) }
+func fatal(message string) { logMessage("FATAL: " + message); os.Exit(1) }
