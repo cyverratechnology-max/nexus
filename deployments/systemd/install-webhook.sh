@@ -22,6 +22,9 @@ EOF
     echo "Edit ${SECRET_FILE}, replace GITHUB_WEBHOOK_SECRET, then rerun this script."
     exit 0
 fi
+grep -q '^APP_DIR=' "${SECRET_FILE}" || printf 'APP_DIR=%s\n' "${APP_DIR}" >> "${SECRET_FILE}"
+grep -q '^UPDATE_SCRIPT=' "${SECRET_FILE}" || printf 'UPDATE_SCRIPT=%s/update.sh\n' "${APP_DIR}" >> "${SECRET_FILE}"
+grep -q '^WEBHOOK_ADDR=' "${SECRET_FILE}" || printf 'WEBHOOK_ADDR=127.0.0.1:9090\n' >> "${SECRET_FILE}"
 grep -q '^GITHUB_WEBHOOK_SECRET=' "${SECRET_FILE}" || { echo 'GITHUB_WEBHOOK_SECRET is missing.' >&2; exit 1; }
 secret="$(sed -n 's/^GITHUB_WEBHOOK_SECRET=//p' "${SECRET_FILE}")"
 [[ "${secret}" != 'REPLACE_WITH_A_RANDOM_SECRET' && ${#secret} -ge 16 ]] || { echo 'Set a random webhook secret of at least 16 characters.' >&2; exit 1; }
