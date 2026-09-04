@@ -1,0 +1,17 @@
+[Unit]
+Description=Cyverra Nexus endpoint agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=-/etc/cyverra/agent.env
+ExecStart=/usr/local/bin/cyverra-agent --api ${CYVERRA_API_URL} --state /var/lib/cyverra/agent.json
+Restart=always
+RestartSec=10
+StateDirectory=cyverra
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
