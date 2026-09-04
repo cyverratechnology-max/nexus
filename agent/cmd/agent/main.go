@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -17,6 +19,8 @@ import (
 	"strings"
 	"time"
 )
+
+const agentVersion = "0.2.0"
 
 type config struct{ Token, API, Credential string }
 type enrollRequest struct{ Token, Hostname, DeviceUUID, Platform, OSName, Architecture, AgentVersion string }
@@ -74,6 +78,9 @@ func main() {
 		}
 		cfg.Credential = enroll(cfg.API, *token, *state)
 	}
+	if !*once && checkForUpdate(cfg) {
+		return
+	}
 	sendHeartbeat(cfg)
 	sendInventory(cfg)
 	sendMetrics(cfg)
@@ -84,11 +91,105 @@ func main() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
+		if checkForUpdate(cfg) {
+			return
+		}
 		sendHeartbeat(cfg)
 		sendInventory(cfg)
 		sendMetrics(cfg)
 		pollCommands(cfg)
 	}
+}
+
+type updateManifest struct {
+	Version            string `json:"version"`
+	LinuxAMD64         string `json:"linux_amd64"`
+	LinuxAMD64SHA256   string `json:"linux_amd64_sha256"`
+	WindowsAMD64       string `json:"windows_amd64"`
+	WindowsAMD64SHA256 string `json:"windows_amd64_sha256"`
+}
+
+func checkForUpdate(cfg config) bool {
+	var manifest updateManifest
+	if err := get(cfg.API+"/downloads/agent-manifest.json", "", &manifest); err != nil || !newerVersion(manifest.Version, agentVersion) {
+		return false
+	}
+	url, expected := manifest.LinuxAMD64, manifest.LinuxAMD64SHA256
+	if runtime.GOOS == "windows" {
+		url, expected = manifest.WindowsAMD64, manifest.WindowsAMD64SHA256
+	}
+	if url == "" || expected == "" {
+		return false
+	}
+	if strings.HasPrefix(url, "/") {
+		url = cfg.API + url
+	}
+	data, err := download(url)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agent update unavailable: %v\n", err)
+		return false
+	}
+	sum := sha256.Sum256(data)
+	if !strings.EqualFold(hex.EncodeToString(sum[:]), expected) {
+		fmt.Fprintln(os.Stderr, "agent update rejected: checksum mismatch")
+		return false
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return false
+	}
+	staged := executable + ".update"
+	if err := os.WriteFile(staged, data, 0700); err != nil {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return stageWindowsUpdate(executable, staged, cfg.API)
+	}
+	if err := os.Rename(staged, executable); err != nil {
+		fmt.Fprintf(os.Stderr, "agent update install failed: %v\n", err)
+		return false
+	}
+	args := append([]string{executable}, os.Args[1:]...)
+	if err := exec.Command(executable, args[1:]...).Start(); err != nil {
+		return false
+	}
+	return true
+}
+func newerVersion(candidate, current string) bool {
+	parse := func(value string) [3]int {
+		var result [3]int
+		parts := strings.Split(strings.TrimPrefix(value, "v"), ".")
+		for index := 0; index < len(parts) && index < 3; index++ {
+			result[index], _ = strconv.Atoi(parts[index])
+		}
+		return result
+	}
+	left, right := parse(candidate), parse(current)
+	for index := 0; index < 3; index++ {
+		if left[index] != right[index] {
+			return left[index] > right[index]
+		}
+	}
+	return false
+}
+func download(url string) ([]byte, error) {
+	result, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer result.Body.Close()
+	if result.StatusCode >= 300 {
+		return nil, fmt.Errorf("download returned %s", result.Status)
+	}
+	return io.ReadAll(io.LimitReader(result.Body, 100<<20))
+}
+func stageWindowsUpdate(executable, staged, api string) bool {
+	script := staged + ".cmd"
+	content := fmt.Sprintf("@echo off\r\ntimeout /t 2 /nobreak >nul\r\nmove /Y \"%s\" \"%s\" >nul\r\nstart \"\" \"%s\" --api \"%s\" --state \"%s\"\r\ndel \"%%~f0\"\r\n", staged, executable, executable, api, defaultStatePath())
+	if err := os.WriteFile(script, []byte(content), 0600); err != nil {
+		return false
+	}
+	return exec.Command("cmd.exe", "/C", script).Start() == nil
 }
 
 type commandJob struct {
@@ -343,7 +444,7 @@ func linuxMemory() (uint64, uint64, bool) {
 }
 func enroll(api, token, state string) string {
 	hostname, _ := os.Hostname()
-	request := enrollRequest{Token: token, Hostname: hostname, DeviceUUID: deviceID(), Platform: runtime.GOOS, OSName: runtime.GOOS, Architecture: runtime.GOARCH, AgentVersion: "0.1.0"}
+	request := enrollRequest{Token: token, Hostname: hostname, DeviceUUID: deviceID(), Platform: runtime.GOOS, OSName: runtime.GOOS, Architecture: runtime.GOARCH, AgentVersion: agentVersion}
 	var response enrollResponse
 	if err := post(api+"/api/v1/agent/enroll", "", request, &response); err != nil {
 		fatal(err.Error())
@@ -363,7 +464,7 @@ func enroll(api, token, state string) string {
 }
 func sendHeartbeat(cfg config) {
 	hostname, _ := os.Hostname()
-	request := map[string]string{"hostname": hostname, "platform": runtime.GOOS, "os_name": runtime.GOOS, "agent_version": "0.1.0"}
+	request := map[string]string{"hostname": hostname, "platform": runtime.GOOS, "os_name": runtime.GOOS, "agent_version": agentVersion}
 	var response map[string]any
 	if err := post(cfg.API+"/api/v1/agent/heartbeat", cfg.Credential, request, &response); err != nil {
 		fmt.Fprintf(os.Stderr, "heartbeat unavailable: %v\n", err)

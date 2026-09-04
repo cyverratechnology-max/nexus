@@ -100,6 +100,12 @@ mkdir -p frontend/public/downloads
 cp bin/cyverra-agent-linux-amd64 frontend/public/downloads/cyverra-agent-linux-amd64
 cp bin/cyverra-agent-windows-amd64.exe frontend/public/downloads/cyverra-agent-windows-amd64.exe
 chmod 0644 frontend/public/downloads/cyverra-agent-*
+LINUX_AGENT_SHA256="$(sha256sum bin/cyverra-agent-linux-amd64 | awk '{print $1}')"
+WINDOWS_AGENT_SHA256="$(sha256sum bin/cyverra-agent-windows-amd64.exe | awk '{print $1}')"
+cat > frontend/public/downloads/agent-manifest.json <<EOF
+{"version":"0.2.0","linux_amd64":"/downloads/cyverra-agent-linux-amd64","linux_amd64_sha256":"${LINUX_AGENT_SHA256}","windows_amd64":"/downloads/cyverra-agent-windows-amd64.exe","windows_amd64_sha256":"${WINDOWS_AGENT_SHA256}"}
+EOF
+chmod 0644 frontend/public/downloads/agent-manifest.json
 
 log "Membuild dashboard"
 cd "${INSTALL_DIR}/frontend"

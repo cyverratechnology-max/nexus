@@ -4,4 +4,4 @@ Enrollment tokens are single-use, hashed at rest, and expire after 24 hours. Dev
 
 Audited command execution is now available to platform administrators, organization administrators, and technicians. Commands are limited to 4096 characters, queued per device, executed by the enrolled agent with a 60-second timeout, and recorded in the command/audit tables. This is a privileged feature: do not expose the development configuration publicly, and add approval workflows and command allowlists before production use.
 
-Remote file transfer, interactive remote terminal, remote desktop, software deployment, policy enforcement, and self-update are not complete. They must be added only with explicit authorization, path validation, streaming limits, package/signature verification, session termination, and security tests.
+Remote file transfer, interactive remote terminal, remote desktop, software deployment, and policy enforcement are not complete. Agent self-update is implemented with HTTPS delivery, SHA-256 verification, staging, and restart behavior; production releases should additionally sign binaries and manifests before distributing them.

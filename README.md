@@ -42,6 +42,8 @@ sudo bash update.sh
 
 The **Devices** view also provides downloads for the native Windows `.exe` and Linux amd64 agent. Downloading the binary is not enrollment: generate a one-time token, then run the command shown by the dashboard.
 
+Agents check the published version manifest automatically. To release an agent update, change `agentVersion` in `agent/cmd/agent/main.go`, then run `sudo bash update.sh` on the server. The update script rebuilds both binaries, regenerates their SHA-256 manifest, and publishes it with the dashboard.
+
 ## Install on Ubuntu 22.04
 
 Copy the project to the server and run:

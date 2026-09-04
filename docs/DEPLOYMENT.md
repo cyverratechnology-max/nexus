@@ -17,6 +17,8 @@ The update script does not recreate the PostgreSQL volume or overwrite `/etc/ngi
 
 The update also builds the native agents and publishes them at `/downloads/cyverra-agent-windows-amd64.exe` and `/downloads/cyverra-agent-linux-amd64`. These binaries are generated deployment artifacts and are ignored by Git. Users still need a one-time enrollment token from the dashboard.
 
+Agent auto-update is checksum-verified. A release changes `agentVersion`, then `update.sh` rebuilds the binaries and writes `agent-manifest.json`. Existing agents check that manifest every 30 seconds. Keep the download paths behind HTTPS; do not replace the manifest or binaries manually without regenerating SHA-256 values.
+
 The Compose API image expects migration files at `backend/migrations` during its build/runtime layout. Put TLS termination, a WAF, and a reverse proxy in front of the API before exposing it. Use managed PostgreSQL, secret injection, backups, TLS, and separate object/metrics storage for production.
 
 ## Ubuntu 22.04 agent
