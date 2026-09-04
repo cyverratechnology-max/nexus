@@ -59,6 +59,7 @@ if command -v go >/dev/null 2>&1; then
     unset GOOS GOARCH
     go build -o bin/cyverra-agent-linux-amd64 ./agent/cmd/agent
     GOOS=windows GOARCH=amd64 go build -o bin/cyverra-agent-windows-amd64.exe ./agent/cmd/agent
+    go build -o bin/cyverra-webhook ./deployments/webhook
     mkdir -p frontend/public/downloads
     cp bin/cyverra-agent-linux-amd64 frontend/public/downloads/cyverra-agent-linux-amd64
     cp bin/cyverra-agent-windows-amd64.exe frontend/public/downloads/cyverra-agent-windows-amd64.exe

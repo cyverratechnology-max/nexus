@@ -17,6 +17,10 @@ The update script does not recreate the PostgreSQL volume or overwrite `/etc/ngi
 
 The update also builds the native agents and publishes them at `/downloads/cyverra-agent-windows-amd64.exe` and `/downloads/cyverra-agent-linux-amd64`. These binaries are generated deployment artifacts and are ignored by Git. Users still need a one-time enrollment token from the dashboard.
 
+## GitHub automatic deployment
+
+Build and install the webhook receiver with `sudo bash deployments/systemd/install-webhook.sh`. It listens only on `127.0.0.1:9090`, validates GitHub HMAC `X-Hub-Signature-256`, accepts only push events for `main`, prevents concurrent deployments, and runs `update.sh` with a 45-minute timeout. Fill `/etc/cyverra/webhook.env` yourself; no GitHub credential is committed to the repository. Set the GitHub webhook URL to `https://your-domain/hooks/github` and use the same `GITHUB_WEBHOOK_SECRET`.
+
 Agent auto-update is checksum-verified. A release changes `agentVersion`, then `update.sh` rebuilds the binaries and writes `agent-manifest.json`. Existing agents check that manifest every 30 seconds. Keep the download paths behind HTTPS; do not replace the manifest or binaries manually without regenerating SHA-256 values.
 
 The Compose API image expects migration files at `backend/migrations` during its build/runtime layout. Put TLS termination, a WAF, and a reverse proxy in front of the API before exposing it. Use managed PostgreSQL, secret injection, backups, TLS, and separate object/metrics storage for production.

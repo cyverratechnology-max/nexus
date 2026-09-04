@@ -46,6 +46,10 @@ For background operation, use `deployments/windows/install-agent.ps1` as Adminis
 
 Agents check the published version manifest automatically. To release an agent update, change `agentVersion` in `agent/cmd/agent/main.go`, then run `sudo bash update.sh` on the server. The update script rebuilds both binaries, regenerates their SHA-256 manifest, and publishes it with the dashboard.
 
+## Automatic GitHub deployment
+
+The signed webhook receiver is built as `bin/cyverra-webhook`. Install it on Ubuntu with `sudo bash deployments/systemd/install-webhook.sh`. On first run it creates `/etc/cyverra/webhook.env`; fill `GITHUB_WEBHOOK_SECRET` with the same random secret configured in the GitHub repository webhook, then rerun the installer. Configure the webhook URL as `https://your-domain/hooks/github`, content type `application/json`, event `Just the push event`, and enable SSL verification.
+
 ## Install on Ubuntu 22.04
 
 Copy the project to the server and run:

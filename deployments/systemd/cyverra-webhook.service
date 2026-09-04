@@ -1,0 +1,19 @@
+[Unit]
+Description=Cyverra Nexus GitHub deployment webhook
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/cyverra-nexus
+EnvironmentFile=/etc/cyverra/webhook.env
+ExecStart=/usr/local/bin/cyverra-webhook
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

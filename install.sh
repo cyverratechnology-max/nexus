@@ -96,6 +96,7 @@ mkdir -p bin
 unset GOOS GOARCH
 go build -o bin/cyverra-agent-linux-amd64 ./agent/cmd/agent
 GOOS=windows GOARCH=amd64 go build -o bin/cyverra-agent-windows-amd64.exe ./agent/cmd/agent
+go build -o bin/cyverra-webhook ./deployments/webhook
 mkdir -p frontend/public/downloads
 cp bin/cyverra-agent-linux-amd64 frontend/public/downloads/cyverra-agent-linux-amd64
 cp bin/cyverra-agent-windows-amd64.exe frontend/public/downloads/cyverra-agent-windows-amd64.exe
@@ -135,6 +136,11 @@ server {
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+    location /hooks/github {
+        proxy_pass http://127.0.0.1:9090;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
     location / { try_files \$uri \$uri/ /index.html; }
 }
