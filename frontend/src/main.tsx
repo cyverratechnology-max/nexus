@@ -382,20 +382,197 @@ function RemoteTerminalPage({ devices, selected, showDevice }: any) {
   </div>
 }
 function RemoteDesktopPage({ devices, selected }: any) {
-  const [deviceId, setDeviceId] = useState(selected?.id ?? '')
+  const [tool, setTool] = useState<'remote' | 'chat' | 'sysinfo' | 'wol' | 'shutdown' | 'sysmgr' | 'announce'>('remote')
+  const [tab, setTab] = useState<'computers' | 'history' | 'settings' | 'recording' | 'performance' | 'confirmation'>('computers')
+  const [viewer, setViewer] = useState<'html5' | 'activex'>('html5')
+  const [filterPlatform, setFilterPlatform] = useState('all')
+  const [filterStatus, setFilterStatus] = useState('all')
+  const [search, setSearch] = useState('')
+  const [sessions, setSessions] = useState<any[]>([])
   const [session, setSession] = useState<any>(null)
   const [msg, setMsg] = useState('')
-  const start = async () => { const r = await fetch(`${API}/api/v1/devices/${deviceId}/remote-sessions`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ protocol: 'WEBRTC' }) }); const b = await r.json(); if (r.ok) { setSession(b); setMsg('Session created. WebRTC agent required.') } else setMsg(b.error?.message ?? 'Failed') }
-  const close = async () => { if (!session) return; await fetch(`${API}/api/v1/remote-sessions/${session.session_id}/close`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' } }); setSession(null); setMsg('Closed') }
-  return <div className="panel"><div className="panel-head"><div><p className="eyebrow">REMOTE DESKTOP</p><h2>WebRTC sessions</h2></div></div>
-    <div className="rmm-action">
-      <label className="rmm-device-select"><span>Target device</span>
-        <select value={deviceId} onChange={e => setDeviceId(e.target.value)}><option value="">-- Select --</option>{devices.filter((d: Device) => d.status === 'ONLINE').map((d: Device) => <option key={d.id} value={d.id}>{d.hostname}</option>)}</select>
-      </label>
-      {session ? <><small>Session {session.session_id} · {session.status}</small><button onClick={close}>Close session</button></> : <button onClick={start} disabled={!deviceId}>Request remote desktop</button>}
-      {msg && <small>{msg}</small>}
+  const [page, setPage] = useState(1)
+  const perPage = 25
+
+  const onlineDevices = devices.filter((d: Device) => d.status === 'ONLINE')
+  const filtered = onlineDevices.filter((d: Device) => {
+    if (filterPlatform !== 'all' && d.platform !== filterPlatform) return false
+    if (search && !d.hostname.toLowerCase().includes(search.toLowerCase())) return false
+    return true
+  })
+  const totalPages = Math.ceil(filtered.length / perPage)
+  const paged = filtered.slice((page - 1) * perPage, page * perPage)
+
+  useEffect(() => {
+    if (tab === 'history') {
+      (async () => {
+        const all: any[] = []
+        for (const d of devices) {
+          const r = await fetch(`${API}/api/v1/devices/${d.id}/remote-sessions`, { headers: authHeaders() })
+          if (r.ok) { const b = await r.json(); (b.data || []).forEach((s: any) => all.push({ ...s, hostname: d.hostname, device_id: d.id })) }
+        }
+        setSessions(all.sort((a: any, b: any) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()))
+      })()
+    }
+  }, [tab, devices])
+
+  const connect = async (deviceId: string) => {
+    const r = await fetch(`${API}/api/v1/devices/${deviceId}/remote-sessions`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ protocol: 'WEBRTC' }) })
+    const b = await r.json()
+    if (r.ok) { setSession(b); setMsg(`Connected to ${devices.find((d: Device) => d.id === deviceId)?.hostname}. WebRTC capture agent required.`) }
+    else setMsg(b.error?.message ?? 'Connection failed')
+  }
+  const closeSession = async () => {
+    if (!session) return
+    await fetch(`${API}/api/v1/remote-sessions/${session.session_id}/close`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: 'operator closed' }) })
+    setSession(null); setMsg('Session closed')
+  }
+
+  const toolItems = [
+    { key: 'remote' as const, label: 'Remote Control', icon: '⊞' },
+    { key: 'chat' as const, label: 'Chat', icon: '○' },
+    { key: 'sysinfo' as const, label: 'System Tools', icon: '◇' },
+    { key: 'wol' as const, label: 'Wake on LAN', icon: '◈' },
+    { key: 'shutdown' as const, label: 'Remote Shutdown', icon: '⊠' },
+    { key: 'sysmgr' as const, label: 'System Manager', icon: '▣' },
+    { key: 'announce' as const, label: 'Announcement', icon: '◎' },
+  ]
+
+  const tabs = [
+    { key: 'computers' as const, label: 'Computers' },
+    { key: 'history' as const, label: 'History' },
+    { key: 'settings' as const, label: 'Settings' },
+    { key: 'recording' as const, label: 'Screen Recording' },
+    { key: 'performance' as const, label: 'Performance' },
+    { key: 'confirmation' as const, label: 'User Confirmation' },
+  ]
+
+  return (
+    <div className="rdp-layout">
+      <div className="rdp-sidebar">
+        <div className="rdp-sidebar-head"><p className="eyebrow">TOOLS</p></div>
+        {toolItems.map(t => (
+          <button key={t.key} className={tool === t.key ? 'active' : ''} onClick={() => setTool(t.key)}>
+            <span className="rdp-tool-icon">{t.icon}</span>{t.label}
+          </button>
+        ))}
+        <div className="rdp-sidebar-foot"><span>Need Additional Tools?</span></div>
+      </div>
+      <div className="rdp-main">
+        {tool === 'remote' && (
+          <>
+            <div className="rdp-info-bar">
+              <p>Remote Control helps you to gain access to remote computer. This requires Cyverra Agent to be installed in client systems. Enable WebRTC controls from where a connection to the client systems is being established.</p>
+              <a href="#">Prerequisites for Remote Control</a> | <a href="#">Need more Features?</a>
+            </div>
+            <div className="rdp-tabs">
+              {tabs.map(t => <button key={t.key} className={tab === t.key ? 'active' : ''} onClick={() => setTab(t.key)}>{t.label}</button>)}
+            </div>
+            {tab === 'computers' && (
+              <div className="rdp-content">
+                <div className="rdp-toolbar">
+                  <div className="rdp-viewer-select">
+                    <label><input type="radio" name="viewer" checked={viewer === 'html5'} onChange={() => setViewer('html5')} /> HTML5 Viewer</label>
+                    <label><input type="radio" name="viewer" checked={viewer === 'activex'} onChange={() => setViewer('activex')} /> WebRTC</label>
+                  </div>
+                  <div className="rdp-filters">
+                    <select value={filterStatus} onChange={e => { setFilterStatus(e.target.value); setPage(1) }}>
+                      <option value="all">Agent Live Status</option>
+                      <option value="online">Online</option>
+                      <option value="offline">Offline</option>
+                    </select>
+                    <select value={filterPlatform} onChange={e => { setFilterPlatform(e.target.value); setPage(1) }}>
+                      <option value="all">Platform</option>
+                      <option value="windows">Windows</option>
+                      <option value="linux">Linux</option>
+                    </select>
+                    <input type="text" className="rdp-search" placeholder="Search hostname..." value={search} onChange={e => { setSearch(e.target.value); setPage(1) }} />
+                    <button className="rdp-refresh" onClick={() => setPage(1)}>⟳</button>
+                  </div>
+                  <span className="rdp-total">Total: {filtered.length}</span>
+                </div>
+                <div className="rdp-table">
+                  <div className="rdp-row rdp-heading">
+                    <span className="rdp-col-icon"></span>
+                    <span className="rdp-col-status"></span>
+                    <span className="rdp-col-name">Computer Name</span>
+                    <span className="rdp-col-user">User Name</span>
+                    <span className="rdp-col-ip">IP Address</span>
+                    <span className="rdp-col-action">Action</span>
+                    <span className="rdp-col-remarks">Remarks</span>
+                    <span className="rdp-col-platform">OS Platform</span>
+                  </div>
+                  {paged.length === 0 ? (
+                    <div className="rdp-empty">No devices available for remote control.</div>
+                  ) : paged.map((d: Device) => (
+                    <div className="rdp-row" key={d.id}>
+                      <span className="rdp-col-icon"><span className="rdp-pc-icon">⊞</span></span>
+                      <span className="rdp-col-status"><i className={`dot ${d.status.toLowerCase()}`} /></span>
+                      <span className="rdp-col-name"><strong>{d.hostname}</strong></span>
+                      <span className="rdp-col-user">--</span>
+                      <span className="rdp-col-ip">--</span>
+                      <span className="rdp-col-action">
+                        {session?.device_id === d.id ? (
+                          <button className="rdp-btn rdp-btn-disconnect" onClick={closeSession}>Disconnect</button>
+                        ) : (
+                          <button className="rdp-btn rdp-btn-connect" onClick={() => connect(d.id)}>Connect</button>
+                        )}
+                      </span>
+                      <span className="rdp-col-remarks">--</span>
+                      <span className="rdp-col-platform"><span className="rdp-platform-icon">{d.platform === 'windows' ? '⊞' : '◉'}</span></span>
+                    </div>
+                  ))}
+                </div>
+                {totalPages > 1 && (
+                  <div className="rdp-pagination">
+                    <span>{(page - 1) * perPage + 1} - {Math.min(page * perPage, filtered.length)} of {filtered.length}</span>
+                    <select value={perPage} disabled><option>25</option></select>
+                    <button disabled={page <= 1} onClick={() => setPage(p => p - 1)}>‹</button>
+                    <button disabled={page >= totalPages} onClick={() => setPage(p => p + 1)}>›</button>
+                  </div>
+                )}
+              </div>
+            )}
+            {tab === 'history' && (
+              <div className="rdp-content">
+                <div className="rdp-table">
+                  <div className="rdp-row rdp-heading">
+                    <span className="rdp-col-name">Device</span>
+                    <span className="rdp-col-status">Status</span>
+                    <span className="rdp-col-ip">Protocol</span>
+                    <span className="rdp-col-action">Started</span>
+                    <span className="rdp-col-remarks">Closed</span>
+                    <span className="rdp-col-platform">Reason</span>
+                  </div>
+                  {sessions.length === 0 ? <div className="rdp-empty">No remote sessions yet.</div> : sessions.map((s: any) => (
+                    <div className="rdp-row" key={s.id}>
+                      <span className="rdp-col-name"><strong>{s.hostname}</strong></span>
+                      <span className="rdp-col-status"><i className={`dot ${s.status === 'CLOSED' ? 'online' : s.status === 'ACTIVE' ? 'teal' : 'gold'}`} />{s.status}</span>
+                      <span className="rdp-col-ip">{s.protocol}</span>
+                      <span className="rdp-col-action">{s.started_at ? new Date(s.started_at).toLocaleString() : '--'}</span>
+                      <span className="rdp-col-remarks">{s.closed_at ? new Date(s.closed_at).toLocaleString() : '--'}</span>
+                      <span className="rdp-col-platform">{s.close_reason || '--'}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {tab === 'settings' && <div className="rdp-content"><div className="rdp-placeholder"><h3>Connection Settings</h3><p>Configure WebRTC STUN/TURN servers, connection timeout, and quality settings.</p></div></div>}
+            {tab === 'recording' && <div className="rdp-content"><div className="rdp-placeholder"><h3>Screen Recording</h3><p>View and download recorded remote sessions.</p></div></div>}
+            {tab === 'performance' && <div className="rdp-content"><div className="rdp-placeholder"><h3>Performance Metrics</h3><p>Real-time performance data during remote sessions.</p></div></div>}
+            {tab === 'confirmation' && <div className="rdp-content"><div className="rdp-placeholder"><h3>User Confirmation</h3><p>Configure user consent prompts before remote connection.</p></div></div>}
+          </>
+        )}
+        {tool === 'chat' && <div className="rdp-content"><div className="rdp-placeholder"><h3>Chat</h3><p>Send messages to remote users before or during a session.</p></div></div>}
+        {tool === 'sysinfo' && <div className="rdp-content"><div className="rdp-placeholder"><h3>System Tools</h3><p>Remote system diagnostics and troubleshooting tools.</p></div></div>}
+        {tool === 'wol' && <div className="rdp-content"><div className="rdp-placeholder"><h3>Wake on LAN</h3><p>Send magic packet to wake up offline devices.</p></div></div>}
+        {tool === 'shutdown' && <div className="rdp-content"><div className="rdp-placeholder"><h3>Remote Shutdown</h3><p>Shutdown or restart multiple devices simultaneously.</p></div></div>}
+        {tool === 'sysmgr' && <div className="rdp-content"><div className="rdp-placeholder"><h3>System Manager</h3><p>Process manager, service manager, and event viewer.</p></div></div>}
+        {tool === 'announce' && <div className="rdp-content"><div className="rdp-placeholder"><h3>Announcement</h3><p>Broadcast messages to all or selected endpoints.</p></div></div>}
+        {msg && <div className="rdp-toast">{msg}<button onClick={() => setMsg('')}>×</button></div>}
+      </div>
     </div>
-  </div>
+  )
 }
 function RemoteFilesPage({ devices, selected }: any) {
   const [deviceId, setDeviceId] = useState(selected?.id ?? '')
