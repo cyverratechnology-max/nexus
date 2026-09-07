@@ -139,6 +139,11 @@ func main() {
 	mux.HandleFunc("POST /api/v1/remote-sessions/{id}/close", s.requireUser(s.closeRemoteSession))
 	mux.HandleFunc("POST /api/v1/agent/remote-sessions/{id}/status", s.agentRemoteSessionStatus)
 	mux.HandleFunc("GET /api/v1/audit-logs", s.requireUser(s.listAuditLogs))
+	mux.HandleFunc("POST /api/v1/devices/{id}/unattended/token", s.requireUser(s.generateUnattendedToken))
+	mux.HandleFunc("DELETE /api/v1/devices/{id}/unattended/token", s.requireUser(s.revokeUnattendedToken))
+	mux.HandleFunc("PUT /api/v1/devices/{id}/unattended", s.requireUser(s.toggleUnattendedAccess))
+	mux.HandleFunc("GET /api/v1/devices/unattended", s.requireUser(s.listUnattendedDevices))
+	mux.HandleFunc("POST /api/v1/unattended/validate", s.validateUnattendedToken)
 	handler := s.cors(s.requestID(mux))
 	addr := env("API_ADDR", ":8443")
 	certFile := env("TLS_CERT_FILE", "")
@@ -861,6 +866,120 @@ func (s *server) listAuditLogs(w http.ResponseWriter, r *http.Request) {
 		result = append(result, item)
 	}
 	writeJSON(w, 200, map[string]any{"data": result})
+}
+
+func (s *server) generateUnattendedToken(w http.ResponseWriter, r *http.Request) {
+	a := r.Context().Value(authContextKey).(auth)
+	if a.Role != "platform_admin" && a.Role != "org_admin" && a.Role != "technician" {
+		writeError(w, 403, "insufficient permission")
+		return
+	}
+	deviceID := r.PathValue("id")
+	plainToken := "ua_" + randomToken(32)
+	tokenHash := hash(plainToken)
+	result, err := s.db.Exec(r.Context(), `UPDATE devices SET unattended_token_hash=$1, unattended_enabled=true, updated_at=now() WHERE id=$2 AND organization_id=$3`,
+		tokenHash, deviceID, a.OrganizationID)
+	if err != nil || result.RowsAffected() != 1 {
+		writeError(w, 404, "device not found")
+		return
+	}
+	_, _ = s.db.Exec(r.Context(), `INSERT INTO audit_logs (organization_id,user_id,device_id,action,resource,metadata) VALUES ($1,$2,$3,'unattended.token.generated','device',jsonb_build_object('device_id',$4))`, a.OrganizationID, a.UserID, a.OrganizationID, deviceID)
+	writeJSON(w, 201, map[string]any{"token": plainToken, "message": "Save this token securely. It will not be shown again."})
+}
+
+func (s *server) revokeUnattendedToken(w http.ResponseWriter, r *http.Request) {
+	a := r.Context().Value(authContextKey).(auth)
+	deviceID := r.PathValue("id")
+	result, err := s.db.Exec(r.Context(), `UPDATE devices SET unattended_token_hash=NULL, unattended_enabled=false, updated_at=now() WHERE id=$1 AND organization_id=$2`,
+		deviceID, a.OrganizationID)
+	if err != nil || result.RowsAffected() != 1 {
+		writeError(w, 404, "device not found")
+		return
+	}
+	_, _ = s.db.Exec(r.Context(), `INSERT INTO audit_logs (organization_id,user_id,device_id,action,resource,metadata) VALUES ($1,$2,$3,'unattended.token.revoked','device',jsonb_build_object('device_id',$4))`, a.OrganizationID, a.UserID, a.OrganizationID, deviceID)
+	writeJSON(w, 200, map[string]string{"status": "revoked"})
+}
+
+func (s *server) toggleUnattendedAccess(w http.ResponseWriter, r *http.Request) {
+	a := r.Context().Value(authContextKey).(auth)
+	if a.Role != "platform_admin" && a.Role != "org_admin" && a.Role != "technician" {
+		writeError(w, 403, "insufficient permission")
+		return
+	}
+	deviceID := r.PathValue("id")
+	var req struct {
+		Enabled  bool   `json:"enabled"`
+		Port     int    `json:"port"`
+		Protocol string `json:"protocol"`
+	}
+	if !decode(r, &req) {
+		writeError(w, 400, "invalid request")
+		return
+	}
+	if req.Protocol == "" { req.Protocol = "VNC" }
+	if req.Port == 0 {
+		if req.Protocol == "RDP" { req.Port = 3389 } else { req.Port = 5900 }
+	}
+	result, err := s.db.Exec(r.Context(), `UPDATE devices SET unattended_enabled=$1, unattended_port=$2, unattended_protocol=$3, updated_at=now() WHERE id=$4 AND organization_id=$5`,
+		req.Enabled, req.Port, req.Protocol, deviceID, a.OrganizationID)
+	if err != nil || result.RowsAffected() != 1 {
+		writeError(w, 404, "device not found")
+		return
+	}
+	_, _ = s.db.Exec(r.Context(), `INSERT INTO audit_logs (organization_id,user_id,device_id,action,resource,metadata) VALUES ($1,$2,$3,'unattended.access.toggled','device',jsonb_build_object('device_id',$4,'enabled',$5,'protocol',$6))`, a.OrganizationID, a.UserID, a.OrganizationID, deviceID, req.Enabled, req.Protocol)
+	writeJSON(w, 200, map[string]any{"enabled": req.Enabled, "port": req.Port, "protocol": req.Protocol})
+}
+
+func (s *server) listUnattendedDevices(w http.ResponseWriter, r *http.Request) {
+	a := r.Context().Value(authContextKey).(auth)
+	rows, err := s.db.Query(r.Context(), `SELECT d.id, d.hostname, d.platform, d.status, d.unattended_enabled, d.unattended_port, d.unattended_protocol, d.unattended_last_used FROM devices d WHERE d.organization_id=$1 AND d.unattended_enabled=true AND d.status <> 'RETIRED' ORDER BY d.hostname`, a.OrganizationID)
+	if err != nil {
+		writeError(w, 500, "unable to list unattended devices")
+		return
+	}
+	defer rows.Close()
+	result := []map[string]any{}
+	for rows.Next() {
+		var id, hostname, platform, status, protocol string
+		var port int
+		var enabled bool
+		var lastUsed sql.NullTime
+		if err := rows.Scan(&id, &hostname, &platform, &status, &enabled, &port, &protocol, &lastUsed); err != nil {
+			writeError(w, 500, "unable to read devices")
+			return
+		}
+		item := map[string]any{"id": id, "hostname": hostname, "platform": platform, "status": status, "enabled": enabled, "port": port, "protocol": protocol}
+		if lastUsed.Valid { item["last_used"] = lastUsed.Time }
+		result = append(result, item)
+	}
+	writeJSON(w, 200, map[string]any{"data": result})
+}
+
+func (s *server) validateUnattendedToken(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Token    string `json:"token"`
+		DeviceID string `json:"device_id"`
+	}
+	if !decode(r, &req) || req.Token == "" {
+		writeError(w, 400, "token is required")
+		return
+	}
+	tokenHash := hash(req.Token)
+	var deviceID, hostname, platform, protocol string
+	var port int
+	var ipAddr sql.NullString
+	err := s.db.QueryRow(r.Context(), `SELECT id, hostname, platform, unattended_port, unattended_protocol, ip_address::text FROM devices WHERE unattended_token_hash=$1 AND unattended_enabled=true AND status='ONLINE'`,
+		tokenHash).Scan(&deviceID, &hostname, &platform, &port, &protocol, &ipAddr)
+	if err != nil {
+		_, _ = s.db.Exec(r.Context(), `INSERT INTO unattended_access_logs (action, token_hash, metadata) VALUES ('failed', $1, jsonb_build_object('reason','invalid token'))`, tokenHash)
+		writeError(w, 401, "invalid or expired unattended access token")
+		return
+	}
+	_, _ = s.db.Exec(r.Context(), `UPDATE devices SET unattended_last_used=now() WHERE id=$1`, deviceID)
+	_, _ = s.db.Exec(r.Context(), `INSERT INTO unattended_access_logs (organization_id, device_id, action, token_hash, metadata) VALUES ((SELECT organization_id FROM devices WHERE id=$1), $1, 'success', $2, jsonb_build_object('hostname',$3,'protocol',$4))`, deviceID, tokenHash, hostname, protocol)
+	ip := "unknown"
+	if ipAddr.Valid { ip = ipAddr.String }
+	writeJSON(w, 200, map[string]any{"device_id": deviceID, "hostname": hostname, "platform": platform, "ip": ip, "port": port, "protocol": protocol})
 }
 
 func (s *server) sign(a auth) string {

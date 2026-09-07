@@ -383,7 +383,7 @@ function RemoteTerminalPage({ devices, selected, showDevice }: any) {
 }
 function RemoteDesktopPage({ devices, selected }: any) {
   const [tool, setTool] = useState<'remote' | 'chat' | 'sysinfo' | 'wol' | 'shutdown' | 'sysmgr' | 'announce'>('remote')
-  const [tab, setTab] = useState<'computers' | 'history' | 'settings' | 'recording' | 'performance' | 'confirmation'>('computers')
+  const [tab, setTab] = useState<'computers' | 'history' | 'unattended' | 'settings' | 'recording' | 'performance' | 'confirmation'>('computers')
   const [viewer, setViewer] = useState<'html5' | 'activex'>('html5')
   const [protocol, setProtocol] = useState<'WEBRTC' | 'VNC' | 'RDP'>('WEBRTC')
   const [filterPlatform, setFilterPlatform] = useState('all')
@@ -394,9 +394,14 @@ function RemoteDesktopPage({ devices, selected }: any) {
   const [msg, setMsg] = useState('')
   const [page, setPage] = useState(1)
   const [connectDevice, setConnectDevice] = useState<string | null>(null)
+  const [connectMode, setConnectMode] = useState<'manual' | 'unattended'>('manual')
+  const [unattendedToken, setUnattendedToken] = useState('')
   const [rdpUser, setRdpUser] = useState('')
   const [rdpPass, setRdpPass] = useState('')
   const [vncPass, setVncPass] = useState('')
+  const [unattendedDevices, setUnattendedDevices] = useState<any[]>([])
+  const [generatedToken, setGeneratedToken] = useState('')
+  const [tokenDialog, setTokenDialog] = useState<string | null>(null)
   const perPage = 25
 
   const onlineDevices = devices.filter((d: Device) => d.status === 'ONLINE')
@@ -419,7 +424,59 @@ function RemoteDesktopPage({ devices, selected }: any) {
         setSessions(all.sort((a: any, b: any) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()))
       })()
     }
+    if (tab === 'unattended') { loadUnattendedDevices() }
   }, [tab, devices])
+
+  const loadUnattendedDevices = async () => {
+    const r = await fetch(`${API}/api/v1/devices/unattended`, { headers: authHeaders() })
+    if (r.ok) setUnattendedDevices((await r.json()).data)
+  }
+
+  const generateToken = async (deviceId: string) => {
+    const r = await fetch(`${API}/api/v1/devices/${deviceId}/unattended/token`, { method: 'POST', headers: authHeaders() })
+    const b = await r.json()
+    if (r.ok) { setGeneratedToken(b.token); setTokenDialog(deviceId); setMsg('Token generated. Copy and save it securely.') }
+    else setMsg(b.error?.message ?? 'Failed')
+  }
+
+  const revokeToken = async (deviceId: string) => {
+    if (!confirm('Revoke unattended access token? The device will lose unattended access.')) return
+    const r = await fetch(`${API}/api/v1/devices/${deviceId}/unattended/token`, { method: 'DELETE', headers: authHeaders() })
+    if (r.ok) { setMsg('Token revoked'); loadUnattendedDevices() } else setMsg('Failed to revoke token')
+  }
+
+  const toggleUnattended = async (deviceId: string, enabled: boolean, port: number, proto: string) => {
+    const r = await fetch(`${API}/api/v1/devices/${deviceId}/unattended`, { method: 'PUT', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled, port, protocol: proto }) })
+    if (r.ok) { setMsg(`Unattended access ${enabled ? 'enabled' : 'disabled'}`); loadUnattendedDevices() }
+  }
+
+  const connectWithToken = async () => {
+    if (!unattendedToken || !connectDevice) return
+    const r = await fetch(`${API}/api/v1/unattended/validate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: unattendedToken, device_id: connectDevice }) })
+    const b = await r.json()
+    if (r.ok) {
+      const body: Record<string, unknown> = { protocol: b.protocol }
+      if (b.protocol === 'RDP') { body.rdp_username = rdpUser; body.rdp_password = rdpPass; body.rdp_port = b.port }
+      if (b.protocol === 'VNC') { body.vnc_password = vncPass; body.vnc_port = b.port }
+      const sr = await fetch(`${API}/api/v1/devices/${b.device_id}/remote-sessions`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      const sb = await sr.json()
+      if (sr.ok) {
+        setSession({ ...sb, device_id: b.device_id })
+        setMsg(`Unattended: connected to ${b.hostname} via ${b.protocol} (${b.ip}:${b.port})`)
+        setConnectDevice(null); setUnattendedToken('')
+      } else setMsg(sb.error?.message ?? 'Session failed')
+    } else setMsg(b.error?.message ?? 'Invalid token')
+  }
+
+  const openConnectDialog = (deviceId: string, mode: 'manual' | 'unattended' = 'manual') => {
+    setConnectMode(mode)
+    if (mode === 'unattended') {
+      setConnectDevice(deviceId); setUnattendedToken(''); setRdpUser(''); setRdpPass(''); setVncPass('')
+      return
+    }
+    if (protocol === 'WEBRTC') { connect(deviceId); return }
+    setConnectDevice(deviceId); setRdpUser(''); setRdpPass(''); setVncPass('')
+  }
 
   const connect = async (deviceId: string) => {
     const body: Record<string, unknown> = { protocol }
@@ -441,10 +498,6 @@ function RemoteDesktopPage({ devices, selected }: any) {
     await fetch(`${API}/api/v1/remote-sessions/${session.session_id}/close`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: 'operator closed' }) })
     setSession(null); setMsg('Session closed')
   }
-  const openConnectDialog = (deviceId: string) => {
-    if (protocol === 'WEBRTC') { connect(deviceId); return }
-    setConnectDevice(deviceId); setRdpUser(''); setRdpPass(''); setVncPass('')
-  }
 
   const toolItems = [
     { key: 'remote' as const, label: 'Remote Control', icon: '⊞' },
@@ -459,6 +512,7 @@ function RemoteDesktopPage({ devices, selected }: any) {
   const tabs = [
     { key: 'computers' as const, label: 'Computers' },
     { key: 'history' as const, label: 'History' },
+    { key: 'unattended' as const, label: 'Unattended Access' },
     { key: 'settings' as const, label: 'Settings' },
     { key: 'recording' as const, label: 'Screen Recording' },
     { key: 'performance' as const, label: 'Performance' },
@@ -583,6 +637,53 @@ function RemoteDesktopPage({ devices, selected }: any) {
                 </div>
               </div>
             )}
+            {tab === 'unattended' && (
+              <div className="rdp-content">
+                <div className="rdp-unattended-info">
+                  <p>Unattended access allows secure remote connections using API tokens instead of passwords. Generate a token per device, then use it to connect without user interaction.</p>
+                </div>
+                <div className="rdp-table">
+                  <div className="rdp-row rdp-heading">
+                    <span className="rdp-col-icon"></span>
+                    <span className="rdp-col-status"></span>
+                    <span className="rdp-col-name">Device</span>
+                    <span className="rdp-col-user">Protocol</span>
+                    <span className="rdp-col-ip">Port</span>
+                    <span className="rdp-col-action">Actions</span>
+                    <span className="rdp-col-remarks">Last Used</span>
+                    <span className="rdp-col-platform">Status</span>
+                  </div>
+                  {devices.filter((d: Device) => d.status === 'ONLINE').map((d: Device) => {
+                    const ua = unattendedDevices.find((u: any) => u.id === d.id)
+                    return (
+                      <div className="rdp-row" key={d.id}>
+                        <span className="rdp-col-icon"><span className="rdp-pc-icon">⊞</span></span>
+                        <span className="rdp-col-status"><i className={`dot ${d.status.toLowerCase()}`} /></span>
+                        <span className="rdp-col-name"><strong>{d.hostname}</strong></span>
+                        <span className="rdp-col-user">{ua?.protocol || 'VNC'}</span>
+                        <span className="rdp-col-ip">{ua?.port || '--'}</span>
+                        <span className="rdp-col-action">
+                          {ua?.enabled ? (
+                            <div className="rdp-ua-actions">
+                              <button className="rdp-btn rdp-btn-connect" onClick={() => openConnectDialog(d.id, 'unattended')}>Connect</button>
+                              <button className="rdp-btn rdp-btn-secondary" onClick={() => generateToken(d.id)}>Rotate</button>
+                              <button className="rdp-btn rdp-btn-danger-sm" onClick={() => revokeToken(d.id)}>Revoke</button>
+                            </div>
+                          ) : (
+                            <button className="rdp-btn rdp-btn-connect" onClick={() => generateToken(d.id)}>Enable</button>
+                          )}
+                        </span>
+                        <span className="rdp-col-remarks">{ua?.last_used ? new Date(ua.last_used).toLocaleString() : 'Never'}</span>
+                        <span className="rdp-col-platform">
+                          {ua?.enabled ? <span className="rdp-badge rdp-badge-active">Active</span> : <span className="rdp-badge rdp-badge-inactive">Off</span>}
+                        </span>
+                      </div>
+                    )
+                  })}
+                </div>
+                {devices.filter((d: Device) => d.status === 'ONLINE').length === 0 && <div className="rdp-empty">No online devices available.</div>}
+              </div>
+            )}
             {tab === 'settings' && <div className="rdp-content"><div className="rdp-placeholder"><h3>Connection Settings</h3><p>Configure WebRTC STUN/TURN servers, connection timeout, and quality settings.</p></div></div>}
             {tab === 'recording' && <div className="rdp-content"><div className="rdp-placeholder"><h3>Screen Recording</h3><p>View and download recorded remote sessions.</p></div></div>}
             {tab === 'performance' && <div className="rdp-content"><div className="rdp-placeholder"><h3>Performance Metrics</h3><p>Real-time performance data during remote sessions.</p></div></div>}
@@ -599,23 +700,61 @@ function RemoteDesktopPage({ devices, selected }: any) {
         {connectDevice && (
           <div className="rdp-modal-overlay" onClick={() => setConnectDevice(null)}>
             <div className="rdp-modal" onClick={e => e.stopPropagation()}>
-              <div className="rdp-modal-head"><h3>Connect via {protocol}</h3><button onClick={() => setConnectDevice(null)}>×</button></div>
+              <div className="rdp-modal-head">
+                <h3>{connectMode === 'unattended' ? 'Unattended Access' : `Connect via ${protocol}`}</h3>
+                <button onClick={() => setConnectDevice(null)}>×</button>
+              </div>
               <div className="rdp-modal-body">
-                <p className="rdp-modal-info">Device: <strong>{connectDeviceName}</strong> · Protocol: <strong>{protocol}</strong></p>
-                {protocol === 'RDP' && (
+                <p className="rdp-modal-info">Device: <strong>{connectDeviceName}</strong></p>
+                {connectMode === 'unattended' ? (
                   <>
-                    <label className="rdp-modal-field"><span>Username</span><input value={rdpUser} onChange={e => setRdpUser(e.target.value)} placeholder="Administrator" /></label>
-                    <label className="rdp-modal-field"><span>Password</span><input type="password" value={rdpPass} onChange={e => setRdpPass(e.target.value)} placeholder="Password" /></label>
+                    <div className="rdp-modal-ua-badge"><span className="rdp-badge rdp-badge-active">Unattended Access</span><span>Enter the device API token to connect without user interaction.</span></div>
+                    <label className="rdp-modal-field"><span>Access Token</span><input value={unattendedToken} onChange={e => setUnattendedToken(e.target.value)} placeholder="ua_..." className="rdp-token-input" /></label>
+                    <p className="rdp-modal-note">The token was generated from the Unattended Access tab. It provides secure access without exposing passwords.</p>
+                  </>
+                ) : (
+                  <>
+                    <p className="rdp-modal-info">Protocol: <strong>{protocol}</strong></p>
+                    {protocol === 'RDP' && (
+                      <>
+                        <label className="rdp-modal-field"><span>Username</span><input value={rdpUser} onChange={e => setRdpUser(e.target.value)} placeholder="Administrator" /></label>
+                        <label className="rdp-modal-field"><span>Password</span><input type="password" value={rdpPass} onChange={e => setRdpPass(e.target.value)} placeholder="Password" /></label>
+                      </>
+                    )}
+                    {protocol === 'VNC' && (
+                      <label className="rdp-modal-field"><span>VNC Password</span><input type="password" value={vncPass} onChange={e => setVncPass(e.target.value)} placeholder="VNC password" /></label>
+                    )}
+                    {protocol === 'WEBRTC' && <p className="rdp-modal-note">WebRTC requires the capture agent to be installed on the target device.</p>}
                   </>
                 )}
-                {protocol === 'VNC' && (
-                  <label className="rdp-modal-field"><span>VNC Password</span><input type="password" value={vncPass} onChange={e => setVncPass(e.target.value)} placeholder="VNC password" /></label>
-                )}
-                {protocol === 'WEBRTC' && <p className="rdp-modal-note">WebRTC requires the capture agent to be installed on the target device.</p>}
               </div>
               <div className="rdp-modal-foot">
                 <button className="rdp-btn rdp-btn-cancel" onClick={() => setConnectDevice(null)}>Cancel</button>
-                <button className="rdp-btn rdp-btn-connect" onClick={() => connect(connectDevice)}>Start Session</button>
+                {connectMode === 'unattended' ? (
+                  <button className="rdp-btn rdp-btn-connect" onClick={connectWithToken} disabled={!unattendedToken}>Connect with Token</button>
+                ) : (
+                  <button className="rdp-btn rdp-btn-connect" onClick={() => connect(connectDevice)}>Start Session</button>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+        {tokenDialog && (
+          <div className="rdp-modal-overlay" onClick={() => setTokenDialog(null)}>
+            <div className="rdp-modal" onClick={e => e.stopPropagation()}>
+              <div className="rdp-modal-head"><h3>Unattended Access Token</h3><button onClick={() => setTokenDialog(null)}>×</button></div>
+              <div className="rdp-modal-body">
+                <div className="rdp-token-display">
+                  <p className="rdp-modal-info">Copy this token and store it securely. <strong>It will not be shown again.</strong></p>
+                  <div className="rdp-token-box">
+                    <code>{generatedToken}</code>
+                    <button className="rdp-btn rdp-btn-copy" onClick={() => { navigator.clipboard?.writeText(generatedToken); setMsg('Token copied to clipboard') }}>Copy</button>
+                  </div>
+                  <p className="rdp-modal-note">Use this token in the Unattended Access tab to connect to this device without passwords.</p>
+                </div>
+              </div>
+              <div className="rdp-modal-foot">
+                <button className="rdp-btn rdp-btn-connect" onClick={() => setTokenDialog(null)}>Done</button>
               </div>
             </div>
           </div>
