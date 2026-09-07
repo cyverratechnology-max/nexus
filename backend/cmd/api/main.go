@@ -131,6 +131,7 @@ func main() {
 	mux.HandleFunc("POST /api/v1/devices/{id}/remote-sessions", s.requireUser(s.createRemoteSession))
 	mux.HandleFunc("GET /api/v1/devices/{id}/remote-sessions", s.requireUser(s.listRemoteSessions))
 	mux.HandleFunc("POST /api/v1/remote-sessions/{id}/close", s.requireUser(s.closeRemoteSession))
+	mux.HandleFunc("GET /api/v1/audit-logs", s.requireUser(s.listAuditLogs))
 	handler := s.cors(s.requestID(mux))
 	addr := env("API_ADDR", ":8443")
 	certFile := env("TLS_CERT_FILE", "")
@@ -779,6 +780,35 @@ func (s *server) closeRemoteSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]string{"status": "CLOSED"})
+}
+func (s *server) listAuditLogs(w http.ResponseWriter, r *http.Request) {
+	a := r.Context().Value(authContextKey).(auth)
+	rows, err := s.db.Query(r.Context(), `SELECT id, user_id, device_id, action, resource, metadata::text, created_at FROM audit_logs WHERE organization_id=$1 ORDER BY created_at DESC LIMIT 200`, a.OrganizationID)
+	if err != nil {
+		writeError(w, 500, "unable to list audit logs")
+		return
+	}
+	defer rows.Close()
+	result := []map[string]any{}
+	for rows.Next() {
+		var id int64
+		var userID, deviceID, action, resource string
+		var metaText string
+		var created time.Time
+		if err := rows.Scan(&id, &userID, &deviceID, &action, &resource, &metaText, &created); err != nil {
+			writeError(w, 500, "unable to read audit logs")
+			return
+		}
+		item := map[string]any{"id": id, "action": action, "resource": resource, "created_at": created}
+		if userID != "" { item["user_id"] = userID }
+		if deviceID != "" { item["device_id"] = deviceID }
+		if metaText != "" && metaText != "{}" {
+			var meta map[string]any
+			if json.Unmarshal([]byte(metaText), &meta) == nil { item["metadata"] = meta }
+		}
+		result = append(result, item)
+	}
+	writeJSON(w, 200, map[string]any{"data": result})
 }
 
 func (s *server) sign(a auth) string {
