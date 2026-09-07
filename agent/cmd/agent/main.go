@@ -688,7 +688,7 @@ func ensureMCAgentRunning(bin string, cfg *mcConfigData) {
 	logMessage("meshcentral .msh file written: " + mshPath)
 	logMessage("meshcentral .msh content: MeshServer=" + wssURL + " MeshID=" + cfg.AgentGroup)
 
-	cmd := exec.Command(bin)
+	cmd := exec.Command(bin, "run")
 	cmd.Dir = binDir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
