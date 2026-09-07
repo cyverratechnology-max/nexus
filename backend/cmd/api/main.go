@@ -177,6 +177,7 @@ func main() {
 	mux.HandleFunc("POST /api/v1/agent/remote-sessions/{id}/status", s.agentRemoteSessionStatus)
 	mux.HandleFunc("GET /api/v1/agent/remote-desktop", s.agentRemoteDesktop)
 	mux.HandleFunc("GET /api/v1/agent/meshcentral-config", s.agentMeshCentralConfig)
+	mux.HandleFunc("GET /api/v1/agent/meshcentral-download", s.agentMeshCentralDownload)
 	mux.HandleFunc("GET /api/v1/remote-sessions/{id}/ws", s.requireUser(s.wsRemoteSession))
 	mux.HandleFunc("GET /api/v1/audit-logs", s.requireUser(s.listAuditLogs))
 	mux.HandleFunc("POST /api/v1/devices/{id}/unattended/token", s.requireUser(s.generateUnattendedToken))
@@ -1002,6 +1003,57 @@ func (s *server) agentMeshCentralConfig(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, 200, map[string]any{"enabled": true, "server_url": serverURL, "api_key": apiKey, "agent_group": agentGroup})
+}
+
+func (s *server) agentMeshCentralDownload(w http.ResponseWriter, r *http.Request) {
+	credential := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	var deviceID string
+	if err := s.db.QueryRow(r.Context(), "SELECT id FROM devices WHERE credential_hash=$1", hash(credential)).Scan(&deviceID); err != nil {
+		writeError(w, 401, "invalid device credential")
+		return
+	}
+	var serverURL, apiKey string
+	err := s.db.QueryRow(r.Context(), `SELECT server_url, api_key FROM meshcentral_config WHERE id='default' AND enabled=true`).Scan(&serverURL, &apiKey)
+	if err != nil || serverURL == "" {
+		writeError(w, 400, "meshcentral not configured")
+		return
+	}
+	agentID := r.URL.Query().Get("id")
+	if agentID == "" {
+		agentID = "4"
+	}
+	dlURL := strings.TrimRight(serverURL, "/") + "/meshagents?id=" + agentID
+	meshID := r.URL.Query().Get("meshid")
+	if meshID != "" {
+		dlURL += "&meshid=" + meshID
+	}
+	req, err := http.NewRequest("GET", dlURL, nil)
+	if err != nil {
+		writeError(w, 500, "failed to build request")
+		return
+	}
+	if apiKey != "" {
+		req.Header.Set("x-meshcentral-apikey", apiKey)
+	}
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		writeError(w, 502, "failed to reach meshcentral: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		writeError(w, 502, fmt.Sprintf("meshcentral returned %d", resp.StatusCode))
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	if cd := resp.Header.Get("Content-Disposition"); cd != "" {
+		w.Header().Set("Content-Disposition", cd)
+	}
+	if cl := resp.Header.Get("Content-Length"); cl != "" {
+		w.Header().Set("Content-Length", cl)
+	}
+	io.Copy(w, resp.Body)
 }
 
 func (s *server) listAuditLogs(w http.ResponseWriter, r *http.Request) {

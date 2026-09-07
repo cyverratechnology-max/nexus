@@ -517,7 +517,7 @@ func manageMeshCentralAgent(cfg config) {
 	mcBin := findMCAgentBinary()
 	if mcBin == "" {
 		logMessage("meshcentral agent not found, attempting download...")
-		downloaded, err := downloadMCAgent(mcConfig)
+		downloaded, err := downloadMCAgent(mcConfig, cfg.API, cfg.Credential)
 		if err != nil {
 			logMessage("meshcentral agent download failed: " + err.Error())
 			return
@@ -605,7 +605,7 @@ func findMCAgentBinary() string {
 	return ""
 }
 
-func downloadMCAgent(cfg *mcConfigData) (string, error) {
+func downloadMCAgent(cfg *mcConfigData, backendAPI, backendCredential string) (string, error) {
 	arch := "4"
 	if runtime.GOARCH == "arm64" {
 		arch = "25"
@@ -635,19 +635,26 @@ func downloadMCAgent(cfg *mcConfigData) (string, error) {
 		return dest, nil
 	}
 
-	url := strings.TrimRight(cfg.ServerURL, "/") + "/meshagents?id=" + arch
+	url := backendAPI + "/api/v1/agent/meshcentral-download?id=" + arch
 	if cfg.AgentGroup != "" {
 		url += "&meshid=" + cfg.AgentGroup
 	}
+	logMessage("meshcentral downloading agent from: " + url)
 
 	client := &http.Client{Timeout: 120 * time.Second}
-	resp, err := client.Get(url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+backendCredential)
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("download returned status %d", resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 500))
+		return "", fmt.Errorf("download returned status %d: %s", resp.StatusCode, string(body))
 	}
 
 	f, err := os.Create(dest)
