@@ -682,7 +682,7 @@ func ensureMCAgentRunning(bin string, cfg *mcConfigData) {
 	wssURL = strings.Replace(wssURL, "http://", "ws://", 1)
 
 	binDir := filepath.Dir(bin)
-	mshPath := filepath.Join(binDir, filepath.Base(bin)+".msh")
+	mshPath := filepath.Join(binDir, strings.TrimSuffix(filepath.Base(bin), filepath.Ext(filepath.Base(bin)))+".msh")
 	mshContent := fmt.Sprintf("MeshServer=%s\nMeshID=%s\n", wssURL, cfg.AgentGroup)
 	os.WriteFile(mshPath, []byte(mshContent), 0600)
 	logMessage("meshcentral .msh file written: " + mshPath)
