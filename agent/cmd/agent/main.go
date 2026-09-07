@@ -64,7 +64,7 @@ type metrics struct {
 }
 
 func main() {
-	api := flag.String("api", "http://localhost:8080", "Cyverra API base URL")
+	api := flag.String("api", "https://app.cyverratech.my.id", "Cyverra API base URL")
 	token := flag.String("enrollment-token", os.Getenv("CYVERRA_ENROLLMENT_TOKEN"), "single-use enrollment token")
 	state := flag.String("state", defaultStatePath(), "agent state file")
 	once := flag.Bool("once", false, "send one heartbeat and exit")

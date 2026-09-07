@@ -132,10 +132,20 @@ func main() {
 	mux.HandleFunc("GET /api/v1/devices/{id}/remote-sessions", s.requireUser(s.listRemoteSessions))
 	mux.HandleFunc("POST /api/v1/remote-sessions/{id}/close", s.requireUser(s.closeRemoteSession))
 	handler := s.cors(s.requestID(mux))
-	addr := env("API_ADDR", ":8080")
+	addr := env("API_ADDR", ":8443")
+	certFile := env("TLS_CERT_FILE", "")
+	keyFile := env("TLS_KEY_FILE", "")
 	logger.Info("api listening", "addr", addr)
-	if err = http.ListenAndServe(addr, handler); err != nil {
-		logger.Error("server", "error", err)
+	if certFile != "" && keyFile != "" {
+		logger.Info("api using TLS", "cert", certFile)
+		if err = http.ListenAndServeTLS(addr, certFile, keyFile, handler); err != nil {
+			logger.Error("server", "error", err)
+		}
+	} else {
+		logger.Info("api using plain HTTP (reverse proxy should handle TLS)")
+		if err = http.ListenAndServe(addr, handler); err != nil {
+			logger.Error("server", "error", err)
+		}
 	}
 }
 
@@ -191,7 +201,7 @@ func (s *server) requestID(next http.Handler) http.Handler {
 }
 func (s *server) cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", env("CORS_ORIGIN", "http://localhost:5173"))
+		w.Header().Set("Access-Control-Allow-Origin", env("CORS_ORIGIN", "https://app.cyverratech.my.id"))
 		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		if r.Method == "OPTIONS" {

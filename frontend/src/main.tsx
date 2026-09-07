@@ -8,7 +8,7 @@ type Metric = { device_id?: string; hostname?: string; status?: string; cpu_perc
 type Inventory = { hostname?: string; platform?: string; os_name?: string; architecture?: string; cpu_cores?: number; memory_total_bytes?: number; memory_used_bytes?: number; network?: { name: string; mac: string; ips: string[] }[]; disks?: { name: string; size_bytes?: number; used_bytes?: number; free_bytes?: number; filesystem?: string }[]; software?: string[]; services?: { name: string; status: string; description?: string }[] }
 type RMMTask = { id: string; status: string; command_type: string; command?: string; params?: Record<string, unknown>; stdout?: string; stderr?: string; created_at: string; started_at?: string; completed_at?: string; file_name?: string; file_path?: string; file_size?: number }
 type RMMCategory = 'terminal' | 'process' | 'service' | 'system' | 'files'
-const API = import.meta.env.VITE_API_URL ?? 'http://localhost:8080'
+const API = import.meta.env.VITE_API_URL ?? 'https://app.cyverratech.my.id'
 const authHeaders = () => ({ Authorization: `Bearer ${localStorage.getItem('token') ?? ''}` })
 
 function App() {
