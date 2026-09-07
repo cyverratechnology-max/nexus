@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -109,6 +110,7 @@ func main() {
 	pollCommands(cfg)
 	pollRemoteSessions(cfg)
 	go startRemoteDesktopWS(cfg)
+	go manageMeshCentralAgent(cfg)
 	if *once {
 		return
 	}
@@ -501,6 +503,169 @@ func handleKeyboard(key string, down bool) {
 	if down {
 		exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command",
 			fmt.Sprintf("Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait(\"%s\")", key)).Run()
+	}
+}
+
+func manageMeshCentralAgent(cfg config) {
+	mcConfig := fetchMCConfig(cfg)
+	if mcConfig == nil || !mcConfig.Enabled || mcConfig.ServerURL == "" {
+		return
+	}
+	logMessage("meshcentral integration enabled, managing MC agent")
+
+	mcBin := findMCAgentBinary()
+	if mcBin == "" {
+		logMessage("meshcentral agent not found, attempting download...")
+		if err := downloadMCAgent(mcConfig); err != nil {
+			logMessage("meshcentral agent download failed: " + err.Error())
+			return
+		}
+		mcBin = findMCAgentBinary()
+	}
+	if mcBin == "" {
+		logMessage("meshcentral agent binary not found after download")
+		return
+	}
+
+	logMessage("meshcentral agent found: " + mcBin)
+	for {
+		ensureMCAgentRunning(mcBin, mcConfig)
+		time.Sleep(60 * time.Second)
+		mcConfig = fetchMCConfig(cfg)
+		if mcConfig == nil || !mcConfig.Enabled {
+			stopMCAgent()
+			return
+		}
+	}
+}
+
+type mcConfigData struct {
+	Enabled    bool   `json:"enabled"`
+	ServerURL  string `json:"server_url"`
+	APIKey     string `json:"api_key"`
+	AgentGroup string `json:"agent_group"`
+}
+
+func fetchMCConfig(cfg config) *mcConfigData {
+	var result mcConfigData
+	if err := get(cfg.API+"/api/v1/meshcentral/config", cfg.Credential, &result); err != nil {
+		return nil
+	}
+	return &result
+}
+
+var mcAgentProcess *os.Process
+
+func findMCAgentBinary() string {
+	paths := []string{
+		"/usr/local/bin/meshagent",
+		"/usr/bin/meshagent",
+		filepath.Join(os.TempDir(), "meshagent"),
+	}
+	if runtime.GOOS == "windows" {
+		paths = []string{
+			filepath.Join(os.Getenv("ProgramFiles"), "MeshCentral", "meshagent.exe"),
+			filepath.Join(os.TempDir(), "meshagent.exe"),
+			"C:\\Program Files\\MeshCentral\\meshagent.exe",
+		}
+	}
+	for _, p := range paths {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+func downloadMCAgent(cfg *mcConfigData) error {
+	arch := "4"
+	if runtime.GOARCH == "arm64" {
+		arch = "25"
+	} else if runtime.GOARCH == "386" {
+		arch = "3"
+	}
+	if runtime.GOOS == "linux" {
+		arch = "6"
+		if runtime.GOARCH == "arm64" {
+			arch = "26"
+		} else if runtime.GOARCH == "386" {
+			arch = "5"
+		}
+	}
+
+	url := strings.TrimRight(cfg.ServerURL, "/") + "/meshagents?id=" + arch
+	if cfg.AgentGroup != "" {
+		url += "&meshid=" + cfg.AgentGroup
+	}
+
+	var dest string
+	if runtime.GOOS == "windows" {
+		dest = filepath.Join(os.TempDir(), "meshagent.exe")
+	} else {
+		dest = filepath.Join(os.TempDir(), "meshagent")
+	}
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("download returned status %d", resp.StatusCode)
+	}
+
+	f, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		return err
+	}
+	if runtime.GOOS != "windows" {
+		os.Chmod(dest, 0755)
+	}
+	logMessage("meshcentral agent downloaded to " + dest)
+	return nil
+}
+
+func ensureMCAgentRunning(bin string, cfg *mcConfigData) {
+	if mcAgentProcess != nil {
+		if err := mcAgentProcess.Signal(syscall.Signal(0)); err == nil {
+			return
+		}
+		mcAgentProcess = nil
+	}
+
+	mshContent := fmt.Sprintf("MeshServer=%s\nMeshID=%s\n", cfg.ServerURL, cfg.AgentGroup)
+	mshPath := bin + ".msh"
+	os.WriteFile(mshPath, []byte(mshContent), 0600)
+
+	args := []string{"-url", cfg.ServerURL}
+	if cfg.AgentGroup != "" {
+		args = append(args, "-meshid", cfg.AgentGroup)
+	}
+	args = append(args, "-mshfile", mshPath)
+
+	cmd := exec.Command(bin, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		logMessage("meshcentral agent start failed: " + err.Error())
+		return
+	}
+	mcAgentProcess = cmd.Process
+	logMessage("meshcentral agent started (pid=" + fmt.Sprint(cmd.Process.Pid) + ")")
+
+	go cmd.Wait()
+}
+
+func stopMCAgent() {
+	if mcAgentProcess != nil {
+		mcAgentProcess.Kill()
+		mcAgentProcess = nil
+		logMessage("meshcentral agent stopped")
 	}
 }
 
