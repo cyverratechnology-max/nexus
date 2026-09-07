@@ -1023,19 +1023,22 @@ func (s *server) agentMeshCentralDownload(w http.ResponseWriter, r *http.Request
 		agentID = "4"
 	}
 	dlURL := strings.TrimRight(serverURL, "/") + "/meshagents?id=" + agentID
-	meshID := r.URL.Query().Get("meshid")
-	if meshID != "" {
-		dlURL += "&meshid=" + meshID
-	}
+
 	req, err := http.NewRequest("GET", dlURL, nil)
 	if err != nil {
 		writeError(w, 500, "failed to build request")
 		return
 	}
-	if apiKey != "" {
-		req.Header.Set("x-meshcentral-apikey", apiKey)
-	}
-	client := &http.Client{Timeout: 120 * time.Second}
+
+	client := &http.Client{Timeout: 120 * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 5 {
+			return fmt.Errorf("too many redirects")
+		}
+		for k, vv := range via[0].Header {
+			req.Header[k] = vv
+		}
+		return nil
+	}}
 	resp, err := client.Do(req)
 	if err != nil {
 		writeError(w, 502, "failed to reach meshcentral: "+err.Error())
@@ -1043,7 +1046,8 @@ func (s *server) agentMeshCentralDownload(w http.ResponseWriter, r *http.Request
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		writeError(w, 502, fmt.Sprintf("meshcentral returned %d", resp.StatusCode))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 500))
+		writeError(w, 502, fmt.Sprintf("meshcentral returned %d: %s", resp.StatusCode, string(body)))
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
