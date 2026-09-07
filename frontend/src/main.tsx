@@ -1,4 +1,4 @@
-import { StrictMode, useEffect, useState, type FormEvent } from 'react'
+import { StrictMode, useEffect, useRef, useState, type FormEvent } from 'react'
 import { createRoot } from 'react-dom/client'
 import './styles.css'
 
@@ -402,6 +402,11 @@ function RemoteDesktopPage({ devices, selected }: any) {
   const [unattendedDevices, setUnattendedDevices] = useState<any[]>([])
   const [generatedToken, setGeneratedToken] = useState('')
   const [tokenDialog, setTokenDialog] = useState<string | null>(null)
+  const [viewerWs, setViewerWs] = useState<WebSocket | null>(null)
+  const [viewerFrame, setViewerFrame] = useState('')
+  const [viewerActive, setViewerActive] = useState(false)
+  const [viewerScale, setViewerScale] = useState(1)
+  const viewerCanvasRef = useRef<HTMLCanvasElement>(null)
   const perPage = 25
 
   const onlineDevices = devices.filter((d: Device) => d.status === 'ONLINE')
@@ -485,18 +490,44 @@ function RemoteDesktopPage({ devices, selected }: any) {
     const r = await fetch(`${API}/api/v1/devices/${deviceId}/remote-sessions`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
     const b = await r.json()
     if (r.ok) {
-      setSession({ ...b, device_id: deviceId })
       const host = devices.find((d: Device) => d.id === deviceId)?.hostname
-      if (protocol === 'WEBRTC') setMsg(`Connected to ${host}. WebRTC capture agent required.`)
-      else if (protocol === 'RDP') setMsg(`RDP session ready. Connect via ${b.host || 'device IP'}:${b.port || 3389}`)
-      else setMsg(`VNC session ready. Connect via ${b.host || 'device IP'}:${b.port || 5900}`)
       setConnectDevice(null)
+      openViewer(deviceId, b.session_id, host || deviceId)
     } else setMsg(b.error?.message ?? 'Connection failed')
   }
+
+  const openViewer = (deviceId: string, sessionId: string, hostname: string) => {
+    const wsBase = API.replace('https://', 'wss://').replace('http://', 'ws://')
+    const wsUrl = `${wsBase}/api/v1/remote-sessions/${sessionId}/ws`
+    const token = localStorage.getItem('token') || ''
+    const ws = new WebSocket(wsUrl)
+    ws.onopen = () => {
+      setSession({ session_id: sessionId, device_id: deviceId, protocol, hostname })
+      setViewerActive(true)
+      setMsg(`Connected to ${hostname}`)
+    }
+    ws.onmessage = (ev) => {
+      if (ev.data instanceof Blob) {
+        const reader = new FileReader()
+        reader.onload = () => setViewerFrame(reader.result as string)
+        reader.readAsDataURL(ev.data)
+      } else {
+        try {
+          const msg = JSON.parse(ev.data)
+          if (msg.type === 'error') setMsg(msg.message)
+        } catch {}
+      }
+    }
+    ws.onclose = () => { setViewerActive(false); setViewerFrame('') }
+    ws.onerror = () => { setMsg('WebSocket connection failed'); setViewerActive(false) }
+    setViewerWs(ws)
+  }
   const closeSession = async () => {
-    if (!session) return
-    await fetch(`${API}/api/v1/remote-sessions/${session.session_id}/close`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: 'operator closed' }) })
-    setSession(null); setMsg('Session closed')
+    if (viewerWs) { viewerWs.close(); setViewerWs(null) }
+    if (session) {
+      await fetch(`${API}/api/v1/remote-sessions/${session.session_id}/close`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: 'operator closed' }) })
+    }
+    setSession(null); setViewerActive(false); setViewerFrame(''); setMsg('Session closed')
   }
 
   const toolItems = [
@@ -533,6 +564,35 @@ function RemoteDesktopPage({ devices, selected }: any) {
         <div className="rdp-sidebar-foot"><span>Need Additional Tools?</span></div>
       </div>
       <div className="rdp-main">
+        {viewerActive && (
+          <div className="rdp-viewer-container">
+            <div className="rdp-viewer-toolbar">
+              <span className="rdp-viewer-title">{session?.hostname || 'Remote Desktop'}</span>
+              <div className="rdp-viewer-controls">
+                <button className="rdp-btn rdp-btn-secondary" onClick={() => setViewerScale(s => Math.max(0.25, s - 0.25))}>-</button>
+                <span className="rdp-viewer-scale">{Math.round(viewerScale * 100)}%</span>
+                <button className="rdp-btn rdp-btn-secondary" onClick={() => setViewerScale(s => Math.min(2, s + 0.25))}>+</button>
+                <button className="rdp-btn rdp-btn-secondary" onClick={() => setViewerScale(1)}>Fit</button>
+                <button className="rdp-btn rdp-btn-danger-sm" onClick={closeSession}>Disconnect</button>
+              </div>
+            </div>
+            <div className="rdp-viewer-screen">
+              {viewerFrame ? (
+                <img
+                  src={viewerFrame}
+                  className="rdp-viewer-canvas"
+                  style={{ transform: `scale(${viewerScale})`, transformOrigin: 'top left' }}
+                  draggable={false}
+                />
+              ) : (
+                <div className="rdp-viewer-waiting">
+                  <div className="rdp-viewer-spinner"></div>
+                  <p>Waiting for agent screen...</p>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
         {tool === 'remote' && (
           <>
             <div className="rdp-info-bar">

@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"io"
 	"net"
 	"net/http"
@@ -17,7 +21,10 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 const agentVersion = "0.2.0"
@@ -101,6 +108,7 @@ func main() {
 	sendMetrics(cfg)
 	pollCommands(cfg)
 	pollRemoteSessions(cfg)
+	go startRemoteDesktopWS(cfg)
 	if *once {
 		return
 	}
@@ -291,6 +299,209 @@ func getLocalIP() string {
 		}
 	}
 	return "127.0.0.1"
+}
+
+func startRemoteDesktopWS(cfg config) {
+	for {
+		time.Sleep(5 * time.Second)
+		runRemoteDesktopWS(cfg)
+	}
+}
+
+func runRemoteDesktopWS(cfg config) {
+	wsURL := strings.Replace(cfg.API, "https://", "wss://", -1)
+	wsURL = strings.Replace(wsURL, "http://", "ws://", -1)
+	wsURL += "/api/v1/agent/remote-desktop"
+
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+	}
+	ws, _, err := dialer.Dial(wsURL, http.Header{"Authorization": []string{"Bearer " + cfg.Credential}})
+	if err != nil {
+		return
+	}
+	defer ws.Close()
+	logMessage("remote desktop websocket connected")
+
+	var mu sync.Mutex
+	capturing := false
+	stopCapture := make(chan struct{})
+
+	for {
+		_, raw, err := ws.ReadMessage()
+		if err != nil {
+			return
+		}
+		var msg struct {
+			Type      string          `json:"type"`
+			SessionID string          `json:"session_id"`
+			Protocol  string          `json:"protocol"`
+			Data      json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			continue
+		}
+
+		switch msg.Type {
+		case "start_session":
+			mu.Lock()
+			if !capturing {
+				capturing = true
+				stopCapture = make(chan struct{})
+				go captureAndStream(ws, msg.SessionID, stopCapture)
+			}
+			mu.Unlock()
+
+		case "input":
+			if msg.Data != nil {
+				handleInput(msg.Data)
+			}
+
+		case "stop_session":
+			mu.Lock()
+			if capturing {
+				capturing = false
+				close(stopCapture)
+			}
+			mu.Unlock()
+		}
+	}
+}
+
+func captureAndStream(ws *websocket.Conn, sessionID string, stop <-chan struct{}) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			frame, err := captureScreen()
+			if err != nil {
+				continue
+			}
+			encoded := base64.StdEncoding.EncodeToString(frame)
+			ws.WriteJSON(map[string]string{
+				"type":       "frame",
+				"session_id": sessionID,
+				"data":       encoded,
+			})
+		}
+	}
+}
+
+func captureScreen() ([]byte, error) {
+	if runtime.GOOS == "windows" {
+		return captureScreenWindows()
+	}
+	return captureScreenLinux()
+}
+
+func captureScreenWindows() ([]byte, error) {
+	ps := `Add-Type -AssemblyName System.Windows.Forms
+$screen = [System.Windows.Forms.Screen]::PrimaryScreen
+$bounds = $screen.Bounds
+$bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
+$graphics = [System.Drawing.Graphics]::FromImage($bmp)
+$graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+$ms = New-Object System.IO.MemoryStream
+$bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+$bytes = $ms.ToArray()
+$ms.Dispose()
+$graphics.Dispose()
+$bmp.Dispose()
+[Convert]::ToBase64String($bytes)`
+	out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", ps).Output()
+	if err != nil {
+		return nil, err
+	}
+	return base64.StdEncoding.DecodeString(strings.TrimSpace(string(out)))
+}
+
+func captureScreenLinux() ([]byte, error) {
+	out, err := exec.Command("sh", "-c", "which xdotool scrot gnome-screenshot 2>/dev/null").Output()
+	if err != nil {
+		return createPlaceholderFrame("Linux Agent - Screen Capture")
+	}
+	tools := strings.Fields(string(out))
+	for _, t := range tools {
+		switch {
+		case strings.Contains(t, "scrot"):
+			img, err := captureWithScrot()
+			if err == nil {
+				return img, nil
+			}
+		}
+	}
+	return createPlaceholderFrame("Linux Agent - Screen Capture")
+}
+
+func captureWithScrot() ([]byte, error) {
+	tmp := filepath.Join(os.TempDir(), "cyverra_screen.png")
+	if err := exec.Command("scrot", tmp).Run(); err != nil {
+		return nil, err
+	}
+	defer os.Remove(tmp)
+	data, err := os.ReadFile(tmp)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+func createPlaceholderFrame(text string) ([]byte, error) {
+	img := image.NewRGBA(image.Rect(0, 0, 800, 600))
+	for y := 0; y < 600; y++ {
+		for x := 0; x < 800; x++ {
+			img.Set(x, y, color.RGBA{R: 30, G: 40, B: 50, A: 255})
+		}
+	}
+	_ = text
+	var buf bytes.Buffer
+	jpeg.Encode(&buf, img, &jpeg.Options{Quality: 50})
+	return buf.Bytes(), nil
+}
+
+func handleInput(data json.RawMessage) {
+	var input struct {
+		Type string `json:"type"`
+		X    int    `json:"x"`
+		Y    int    `json:"y"`
+		Key  string `json:"key"`
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(data, &input); err != nil {
+		return
+	}
+	if runtime.GOOS != "windows" {
+		return
+	}
+	switch input.Type {
+	case "mousemove":
+		exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command",
+			fmt.Sprintf("Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(%d,%d)", input.X, input.Y)).Run()
+	case "mousedown", "mouseup":
+		exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command",
+			fmt.Sprintf("Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(%d,%d)", input.X, input.Y)).Run()
+	case "click":
+		exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command",
+			fmt.Sprintf("Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(%d,%d); Add-Type -AssemblyName System.Windows.Forms -ReferencedAssemblies System.Drawing; [System.Windows.Forms.SendKeys]::SendWait('')", input.X, input.Y)).Run()
+	case "keydown":
+		handleKeyboard(input.Key, true)
+	case "keyup":
+		handleKeyboard(input.Key, false)
+	}
+}
+
+func handleKeyboard(key string, down bool) {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	if down {
+		exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command",
+			fmt.Sprintf("Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait(\"%s\")", key)).Run()
+	}
 }
 
 func executeRMMJob(cfg config, job commandJob) *commandResult {

@@ -17,8 +17,10 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -28,10 +30,44 @@ type contextKey string
 const authContextKey contextKey = "auth"
 
 type auth struct{ UserID, OrganizationID, Role string }
+
+type sessionRelay struct {
+	mu      sync.RWMutex
+	agents  map[string]*websocket.Conn
+	log     *slog.Logger
+}
+
+func newSessionRelay(log *slog.Logger) *sessionRelay {
+	return &sessionRelay{agents: make(map[string]*websocket.Conn), log: log}
+}
+
+func (sr *sessionRelay) registerAgent(deviceID string, conn *websocket.Conn) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	if old, ok := sr.agents[deviceID]; ok {
+		old.Close()
+	}
+	sr.agents[deviceID] = conn
+	sr.log.Info("agent connected", "device_id", deviceID)
+}
+
+func (sr *sessionRelay) unregisterAgent(deviceID string) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	delete(sr.agents, deviceID)
+	sr.log.Info("agent disconnected", "device_id", deviceID)
+}
+
+func (sr *sessionRelay) getAgent(deviceID string) *websocket.Conn {
+	sr.mu.RLock()
+	defer sr.mu.RUnlock()
+	return sr.agents[deviceID]
+}
 type server struct {
 	db     *pgxpool.Pool
 	secret []byte
 	log    *slog.Logger
+	relay  *sessionRelay
 }
 type loginRequest struct{ Email, Password string }
 type enrollRequest struct{ Token, Hostname, DeviceUUID, SerialNumber, Manufacturer, Model, Platform, OSName, OSVersion, Architecture, AgentVersion string }
@@ -113,7 +149,7 @@ func main() {
 		logger.Error("bootstrap admin", "error", err)
 		os.Exit(1)
 	}
-	s := &server{db: db, secret: []byte(env("JWT_SECRET", "development-secret-change-me")), log: logger}
+	s := &server{db: db, secret: []byte(env("JWT_SECRET", "development-secret-change-me")), log: logger, relay: newSessionRelay(logger)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.health)
 	mux.HandleFunc("POST /api/v1/auth/login", s.login)
@@ -138,6 +174,8 @@ func main() {
 	mux.HandleFunc("GET /api/v1/devices/{id}/remote-sessions", s.requireUser(s.listRemoteSessions))
 	mux.HandleFunc("POST /api/v1/remote-sessions/{id}/close", s.requireUser(s.closeRemoteSession))
 	mux.HandleFunc("POST /api/v1/agent/remote-sessions/{id}/status", s.agentRemoteSessionStatus)
+	mux.HandleFunc("GET /api/v1/agent/remote-desktop", s.agentRemoteDesktop)
+	mux.HandleFunc("GET /api/v1/remote-sessions/{id}/ws", s.requireUser(s.wsRemoteSession))
 	mux.HandleFunc("GET /api/v1/audit-logs", s.requireUser(s.listAuditLogs))
 	mux.HandleFunc("POST /api/v1/devices/{id}/unattended/token", s.requireUser(s.generateUnattendedToken))
 	mux.HandleFunc("DELETE /api/v1/devices/{id}/unattended/token", s.requireUser(s.revokeUnattendedToken))
@@ -838,6 +876,110 @@ func (s *server) agentRemoteSessionStatus(w http.ResponseWriter, r *http.Request
 	}
 	writeJSON(w, 200, map[string]string{"status": "accepted"})
 }
+
+var wsUpgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+	ReadBufferSize:  64 * 1024,
+	WriteBufferSize: 64 * 1024,
+}
+
+func (s *server) wsRemoteSession(w http.ResponseWriter, r *http.Request) {
+	a := r.Context().Value(authContextKey).(auth)
+	sessionID := r.PathValue("id")
+
+	var deviceID, protocol string
+	err := s.db.QueryRow(r.Context(),
+		`SELECT device_id, protocol FROM remote_sessions WHERE id=$1 AND organization_id=$2 AND status IN ('REQUESTED','APPROVED','CONNECTING','ACTIVE')`,
+		sessionID, a.OrganizationID).Scan(&deviceID, &protocol)
+	if err != nil {
+		writeError(w, 404, "session not found")
+		return
+	}
+
+	ws, err := wsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		s.log.Error("websocket upgrade", "error", err)
+		return
+	}
+	defer ws.Close()
+
+	agentConn := s.relay.getAgent(deviceID)
+	if agentConn == nil {
+		_ = ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","message":"agent not connected"}`))
+		return
+	}
+
+	s.log.Info("browser connected to relay", "session", sessionID, "device", deviceID)
+	_, _ = s.db.Exec(r.Context(), `UPDATE remote_sessions SET status='ACTIVE', started_at=now() WHERE id=$1`, sessionID)
+
+	agentConn.WriteJSON(map[string]string{"type": "start_session", "session_id": sessionID, "protocol": protocol})
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	go func() {
+		defer cancel()
+		for {
+			_, msg, err := ws.ReadMessage()
+			if err != nil {
+				return
+			}
+			agentConn.WriteJSON(map[string]any{"type": "input", "session_id": sessionID, "data": json.RawMessage(msg)})
+		}
+	}()
+
+	go func() {
+		defer cancel()
+		for {
+			_, msg, err := agentConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			ws.WriteMessage(websocket.BinaryMessage, msg)
+		}
+	}()
+
+	<-ctx.Done()
+	s.log.Info("browser relay closed", "session", sessionID)
+	_, _ = s.db.Exec(r.Context(), `UPDATE remote_sessions SET status='CLOSED', closed_at=now(), close_reason='browser disconnected' WHERE id=$1 AND status='ACTIVE'`, sessionID)
+}
+
+func (s *server) agentRemoteDesktop(w http.ResponseWriter, r *http.Request) {
+	credential := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	var deviceID string
+	if err := s.db.QueryRow(r.Context(), "SELECT id FROM devices WHERE credential_hash=$1", hash(credential)).Scan(&deviceID); err != nil {
+		writeError(w, 401, "invalid device credential")
+		return
+	}
+
+	ws, err := wsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		s.log.Error("agent ws upgrade", "error", err)
+		return
+	}
+	defer ws.Close()
+
+	s.relay.registerAgent(deviceID, ws)
+	defer s.relay.unregisterAgent(deviceID)
+
+	s.log.Info("agent remote desktop connected", "device", deviceID)
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	go func() {
+		defer cancel()
+		for {
+			_, _, err := ws.ReadMessage()
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	<-ctx.Done()
+}
+
 func (s *server) listAuditLogs(w http.ResponseWriter, r *http.Request) {
 	a := r.Context().Value(authContextKey).(auth)
 	rows, err := s.db.Query(r.Context(), `SELECT id, user_id, device_id, action, resource, metadata::text, created_at FROM audit_logs WHERE organization_id=$1 ORDER BY created_at DESC LIMIT 200`, a.OrganizationID)
