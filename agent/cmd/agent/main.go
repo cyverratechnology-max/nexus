@@ -548,7 +548,7 @@ type mcConfigData struct {
 
 func fetchMCConfig(cfg config) *mcConfigData {
 	var result mcConfigData
-	if err := get(cfg.API+"/api/v1/meshcentral/config", cfg.Credential, &result); err != nil {
+	if err := get(cfg.API+"/api/v1/agent/meshcentral-config", cfg.Credential, &result); err != nil {
 		return nil
 	}
 	return &result

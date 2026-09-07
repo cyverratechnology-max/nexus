@@ -13,6 +13,12 @@ CREATE TABLE IF NOT EXISTS meshcentral_config (
 
 INSERT INTO meshcentral_config (id) VALUES ('default') ON CONFLICT (id) DO NOTHING;
 
+UPDATE meshcentral_config SET
+    server_url = 'https://api.cyverratech.my.id',
+    enabled = true,
+    sync_interval = 60
+WHERE id = 'default' AND server_url = '';
+
 -- MeshCentral devices synced to NEXUS
 CREATE TABLE IF NOT EXISTS meshcentral_devices (
     id              TEXT PRIMARY KEY,

@@ -1028,7 +1028,7 @@ function MeshCentralSettingsPage() {
   const [saving, setSaving] = useState(false)
 
   useEffect(() => {
-    fetch(`${API}/api/v1/meshcentral/config`, { headers: authHeaders() }).then(r => r.ok ? r.json() : null).then(d => { if (d) setConfig(d) })
+    fetch(`${API}/api/v1/meshcentral/config`, { headers: authHeaders() }).then(r => r.ok ? r.json() : null).then(d => { if (d) setConfig({ ...config, ...d }) })
   }, [])
 
   const save = async () => {

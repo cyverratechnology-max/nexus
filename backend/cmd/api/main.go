@@ -175,6 +175,7 @@ func main() {
 	mux.HandleFunc("POST /api/v1/remote-sessions/{id}/close", s.requireUser(s.closeRemoteSession))
 	mux.HandleFunc("POST /api/v1/agent/remote-sessions/{id}/status", s.agentRemoteSessionStatus)
 	mux.HandleFunc("GET /api/v1/agent/remote-desktop", s.agentRemoteDesktop)
+	mux.HandleFunc("GET /api/v1/agent/meshcentral-config", s.agentMeshCentralConfig)
 	mux.HandleFunc("GET /api/v1/remote-sessions/{id}/ws", s.requireUser(s.wsRemoteSession))
 	mux.HandleFunc("GET /api/v1/audit-logs", s.requireUser(s.listAuditLogs))
 	mux.HandleFunc("POST /api/v1/devices/{id}/unattended/token", s.requireUser(s.generateUnattendedToken))
@@ -983,6 +984,23 @@ func (s *server) agentRemoteDesktop(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	<-ctx.Done()
+}
+
+func (s *server) agentMeshCentralConfig(w http.ResponseWriter, r *http.Request) {
+	credential := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	var deviceID string
+	if err := s.db.QueryRow(r.Context(), "SELECT id FROM devices WHERE credential_hash=$1", hash(credential)).Scan(&deviceID); err != nil {
+		writeError(w, 401, "invalid device credential")
+		return
+	}
+	var serverURL, apiKey, agentGroup string
+	var enabled bool
+	err := s.db.QueryRow(r.Context(), `SELECT server_url, api_key, agent_group, enabled FROM meshcentral_config WHERE id='default'`).Scan(&serverURL, &apiKey, &agentGroup, &enabled)
+	if err != nil || !enabled || serverURL == "" {
+		writeJSON(w, 200, map[string]any{"enabled": false})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"enabled": true, "server_url": serverURL, "api_key": apiKey, "agent_group": agentGroup})
 }
 
 func (s *server) listAuditLogs(w http.ResponseWriter, r *http.Request) {
