@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -60,15 +61,25 @@ type metricsRequest struct {
 	MemoryTotalBytes *uint64  `json:"memory_total_bytes"`
 }
 type commandRequest struct {
-	Command string `json:"command"`
+	Command     string         `json:"command"`
+	CommandType string         `json:"command_type"`
+	Params      map[string]any `json:"params"`
+	FileName    string         `json:"file_name"`
+	FilePath    string         `json:"file_path"`
 }
 type commandResult struct {
-	ID       string `json:"id"`
-	Command  string `json:"command,omitempty"`
-	Status   string `json:"status"`
-	ExitCode *int   `json:"exit_code,omitempty"`
-	Stdout   string `json:"stdout"`
-	Stderr   string `json:"stderr"`
+	ID          string         `json:"id"`
+	Command     string         `json:"command,omitempty"`
+	CommandType string         `json:"command_type,omitempty"`
+	Params      map[string]any `json:"params,omitempty"`
+	Status      string         `json:"status"`
+	ExitCode    *int           `json:"exit_code,omitempty"`
+	Stdout      string         `json:"stdout"`
+	Stderr      string         `json:"stderr"`
+	FileName    string         `json:"file_name,omitempty"`
+	FilePath    string         `json:"file_path,omitempty"`
+	FileContent []byte         `json:"-"`
+	FileSize    *int64         `json:"file_size,omitempty"`
 }
 type remoteSessionRequest struct {
 	Protocol string `json:"protocol"`
@@ -113,6 +124,10 @@ func main() {
 	mux.HandleFunc("GET /api/v1/agent/commands", s.agentCommands)
 	mux.HandleFunc("POST /api/v1/agent/commands/{id}/result", s.agentCommandResult)
 	mux.HandleFunc("GET /api/v1/devices/{id}/commands", s.requireUser(s.listCommands))
+	mux.HandleFunc("GET /api/v1/devices/{id}/rmm/tasks", s.requireUser(s.listRMMTasks))
+	mux.HandleFunc("POST /api/v1/devices/{id}/rmm/execute", s.requireUser(s.executeRMM))
+	mux.HandleFunc("POST /api/v1/agent/file-content/{id}", s.agentFileContent)
+	mux.HandleFunc("GET /api/v1/devices/{id}/rmm/download/{taskId}", s.requireUser(s.downloadRMMFile))
 	mux.HandleFunc("POST /api/v1/devices/{id}/remote-sessions", s.requireUser(s.createRemoteSession))
 	mux.HandleFunc("GET /api/v1/devices/{id}/remote-sessions", s.requireUser(s.listRemoteSessions))
 	mux.HandleFunc("POST /api/v1/remote-sessions/{id}/close", s.requireUser(s.closeRemoteSession))
@@ -430,13 +445,34 @@ func (s *server) createCommand(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "command must be between 1 and 4096 characters")
 		return
 	}
+	if req.CommandType == "" {
+		req.CommandType = "execute_command"
+	}
+	validTypes := map[string]bool{
+		"execute_command": true, "execute_script": true, "powershell": true, "cmd": true, "bash": true,
+		"kill_process": true, "start_process": true,
+		"restart_service": true, "stop_service": true, "start_service": true,
+		"reboot": true, "shutdown": true, "lock_workstation": true, "logoff_user": true,
+		"retrieve_file": true, "upload_file": true, "delete_file": true, "rename_file": true,
+		"browse_filesystem": true,
+	}
+	if !validTypes[req.CommandType] {
+		writeError(w, 400, "invalid command_type")
+		return
+	}
+	paramsJSON := "{}"
+	if req.Params != nil {
+		b, _ := json.Marshal(req.Params)
+		paramsJSON = string(b)
+	}
 	var id string
-	err := s.db.QueryRow(r.Context(), `INSERT INTO commands (organization_id, device_id, user_id, command) SELECT $1, id, $2, $3 FROM devices WHERE id=$4 AND organization_id=$1 RETURNING id`, a.OrganizationID, a.UserID, req.Command, r.PathValue("id")).Scan(&id)
+	err := s.db.QueryRow(r.Context(), `INSERT INTO commands (organization_id, device_id, user_id, command, command_type, params, file_name, file_path) SELECT $1, id, $2, $3, $4, $5::jsonb, $6, $7 FROM devices WHERE id=$8 AND organization_id=$1 RETURNING id`,
+		a.OrganizationID, a.UserID, req.Command, req.CommandType, paramsJSON, req.FileName, req.FilePath, r.PathValue("id")).Scan(&id)
 	if err != nil {
 		writeError(w, 404, "device not found")
 		return
 	}
-	_, _ = s.db.Exec(r.Context(), `INSERT INTO audit_logs (organization_id,user_id,device_id,action,resource,metadata) VALUES ($1,$2,$3,'command.created','command',jsonb_build_object('command_id',$4))`, a.OrganizationID, a.UserID, r.PathValue("id"), id)
+	_, _ = s.db.Exec(r.Context(), `INSERT INTO audit_logs (organization_id,user_id,device_id,action,resource,metadata) VALUES ($1,$2,$3,'rmm.task.created','rmm_task',jsonb_build_object('task_id',$4,'command_type',$5))`, a.OrganizationID, a.UserID, r.PathValue("id"), id, req.CommandType)
 	writeJSON(w, 202, map[string]string{"command_id": id, "status": "QUEUED"})
 }
 func (s *server) agentCommands(w http.ResponseWriter, r *http.Request) {
@@ -446,7 +482,7 @@ func (s *server) agentCommands(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 401, "invalid device credential")
 		return
 	}
-	rows, err := s.db.Query(r.Context(), `UPDATE commands SET status='RUNNING', started_at=now() WHERE id=(SELECT id FROM commands WHERE device_id=$1 AND status='QUEUED' ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING id, status, exit_code, stdout, stderr`, deviceID)
+	rows, err := s.db.Query(r.Context(), `UPDATE commands SET status='RUNNING', started_at=now() WHERE id=(SELECT id FROM commands WHERE device_id=$1 AND status='QUEUED' ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING id, command, command_type, params::text, exit_code, stdout, stderr, file_name, file_path`, deviceID)
 	if err != nil {
 		writeError(w, 500, "unable to load commands")
 		return
@@ -454,9 +490,13 @@ func (s *server) agentCommands(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	if rows.Next() {
 		var result commandResult
-		if err := rows.Scan(&result.ID, &result.Command, &result.Status, &result.ExitCode, &result.Stdout, &result.Stderr); err != nil {
+		var paramsText string
+		if err := rows.Scan(&result.ID, &result.Command, &result.CommandType, &paramsText, &result.ExitCode, &result.Stdout, &result.Stderr, &result.FileName, &result.FilePath); err != nil {
 			writeError(w, 500, "unable to read command")
 			return
+		}
+		if paramsText != "" {
+			_ = json.Unmarshal([]byte(paramsText), &result.Params)
 		}
 		writeJSON(w, 200, result)
 		return
@@ -475,16 +515,18 @@ func (s *server) agentCommandResult(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid command result")
 		return
 	}
-	result, err := s.db.Exec(r.Context(), `UPDATE commands SET status=$1, exit_code=$2, stdout=$3, stderr=$4, completed_at=now() WHERE id=$5 AND device_id=$6 AND status='RUNNING'`, req.Status, req.ExitCode, req.Stdout, req.Stderr, r.PathValue("id"), deviceID)
+	result, err := s.db.Exec(r.Context(), `UPDATE commands SET status=$1, exit_code=$2, stdout=$3, stderr=$4, completed_at=now(), file_name=COALESCE(NULLIF($5,''),file_name), file_path=COALESCE(NULLIF($6,''),file_path), file_size=$7 WHERE id=$8 AND device_id=$9 AND status='RUNNING'`,
+		req.Status, req.ExitCode, req.Stdout, req.Stderr, req.FileName, req.FilePath, req.FileSize, r.PathValue("id"), deviceID)
 	if err != nil || result.RowsAffected() != 1 {
 		writeError(w, 404, "command not found")
 		return
 	}
+	_, _ = s.db.Exec(r.Context(), `INSERT INTO audit_logs (organization_id,user_id,device_id,action,resource,metadata) VALUES ((SELECT organization_id FROM devices WHERE id=$1),(SELECT user_id FROM commands WHERE id=$2),$1,'rmm.task.completed','rmm_task',jsonb_build_object('task_id',$2,'status',$3,'command_type',(SELECT command_type FROM commands WHERE id=$2)))`, deviceID, r.PathValue("id"), req.Status)
 	writeJSON(w, 200, map[string]string{"status": "accepted"})
 }
 func (s *server) listCommands(w http.ResponseWriter, r *http.Request) {
 	a := r.Context().Value(authContextKey).(auth)
-	rows, err := s.db.Query(r.Context(), `SELECT c.id,c.status,c.exit_code,c.stdout,c.stderr,c.created_at FROM commands c WHERE c.device_id=$1 AND c.organization_id=$2 ORDER BY c.created_at DESC LIMIT 50`, r.PathValue("id"), a.OrganizationID)
+	rows, err := s.db.Query(r.Context(), `SELECT c.id,c.status,c.command_type,c.params::text,c.exit_code,c.stdout,c.stderr,c.created_at,c.file_name,c.file_path,c.file_size FROM commands c WHERE c.device_id=$1 AND c.organization_id=$2 ORDER BY c.created_at DESC LIMIT 50`, r.PathValue("id"), a.OrganizationID)
 	if err != nil {
 		writeError(w, 500, "unable to list commands")
 		return
@@ -492,20 +534,173 @@ func (s *server) listCommands(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	result := []map[string]any{}
 	for rows.Next() {
-		var id, status, stdout, stderr string
+		var id, status, commandType, stdout, stderr string
+		var paramsText string
 		var code sql.NullInt32
 		var created time.Time
-		if err := rows.Scan(&id, &status, &code, &stdout, &stderr, &created); err != nil {
+		var fileName, filePath sql.NullString
+		var fileSize sql.NullInt64
+		if err := rows.Scan(&id, &status, &commandType, &paramsText, &code, &stdout, &stderr, &created, &fileName, &filePath, &fileSize); err != nil {
 			writeError(w, 500, "unable to read commands")
 			return
 		}
-		item := map[string]any{"id": id, "status": status, "stdout": stdout, "stderr": stderr, "created_at": created}
+		item := map[string]any{"id": id, "status": status, "command_type": commandType, "stdout": stdout, "stderr": stderr, "created_at": created}
 		if code.Valid {
 			item["exit_code"] = code.Int32
+		}
+		if fileName.Valid {
+			item["file_name"] = fileName.String
+		}
+		if filePath.Valid {
+			item["file_path"] = filePath.String
+		}
+		if fileSize.Valid {
+			item["file_size"] = fileSize.Int64
+		}
+		if paramsText != "" && paramsText != "{}" {
+			var params map[string]any
+			if json.Unmarshal([]byte(paramsText), &params) == nil {
+				item["params"] = params
+			}
 		}
 		result = append(result, item)
 	}
 	writeJSON(w, 200, map[string]any{"data": result})
+}
+func (s *server) listRMMTasks(w http.ResponseWriter, r *http.Request) {
+	a := r.Context().Value(authContextKey).(auth)
+	rows, err := s.db.Query(r.Context(), `SELECT c.id,c.status,c.command_type,c.command,c.params::text,c.exit_code,c.stdout,c.stderr,c.created_at,c.started_at,c.completed_at,c.file_name,c.file_path,c.file_size FROM commands c WHERE c.device_id=$1 AND c.organization_id=$2 AND c.command_type <> 'execute_command' ORDER BY c.created_at DESC LIMIT 100`, r.PathValue("id"), a.OrganizationID)
+	if err != nil {
+		writeError(w, 500, "unable to list RMM tasks")
+		return
+	}
+	defer rows.Close()
+	result := []map[string]any{}
+	for rows.Next() {
+		var id, status, commandType, command, stdout, stderr string
+		var paramsText string
+		var code sql.NullInt32
+		var created time.Time
+		var started, completed sql.NullTime
+		var fileName, filePath sql.NullString
+		var fileSize sql.NullInt64
+		if err := rows.Scan(&id, &status, &commandType, &command, &paramsText, &code, &stdout, &stderr, &created, &started, &completed, &fileName, &filePath, &fileSize); err != nil {
+			writeError(w, 500, "unable to read RMM tasks")
+			return
+		}
+		item := map[string]any{"id": id, "status": status, "command_type": commandType, "command": command, "stdout": stdout, "stderr": stderr, "created_at": created}
+		if code.Valid {
+			item["exit_code"] = code.Int32
+		}
+		if started.Valid {
+			item["started_at"] = started.Time
+		}
+		if completed.Valid {
+			item["completed_at"] = completed.Time
+		}
+		if fileName.Valid {
+			item["file_name"] = fileName.String
+		}
+		if filePath.Valid {
+			item["file_path"] = filePath.String
+		}
+		if fileSize.Valid {
+			item["file_size"] = fileSize.Int64
+		}
+		if paramsText != "" && paramsText != "{}" {
+			var params map[string]any
+			if json.Unmarshal([]byte(paramsText), &params) == nil {
+				item["params"] = params
+			}
+		}
+		result = append(result, item)
+	}
+	writeJSON(w, 200, map[string]any{"data": result})
+}
+func (s *server) executeRMM(w http.ResponseWriter, r *http.Request) {
+	a := r.Context().Value(authContextKey).(auth)
+	if a.Role != "platform_admin" && a.Role != "org_admin" && a.Role != "technician" {
+		writeError(w, 403, "insufficient permission")
+		return
+	}
+	var req commandRequest
+	if !decode(r, &req) {
+		writeError(w, 400, "invalid request")
+		return
+	}
+	if req.CommandType == "" {
+		writeError(w, 400, "command_type is required")
+		return
+	}
+	validTypes := map[string]bool{
+		"powershell": true, "cmd": true, "bash": true,
+		"execute_command": true, "execute_script": true,
+		"kill_process": true, "start_process": true,
+		"restart_service": true, "stop_service": true, "start_service": true,
+		"reboot": true, "shutdown": true, "lock_workstation": true, "logoff_user": true,
+		"retrieve_file": true, "upload_file": true, "delete_file": true, "rename_file": true,
+		"browse_filesystem": true,
+	}
+	if !validTypes[req.CommandType] {
+		writeError(w, 400, "invalid command_type")
+		return
+	}
+	paramsJSON := "{}"
+	if req.Params != nil {
+		b, _ := json.Marshal(req.Params)
+		paramsJSON = string(b)
+	}
+	var id string
+	err := s.db.QueryRow(r.Context(), `INSERT INTO commands (organization_id, device_id, user_id, command, command_type, params, file_name, file_path) SELECT $1, id, $2, $3, $4, $5::jsonb, $6, $7 FROM devices WHERE id=$8 AND organization_id=$1 AND status <> 'RETIRED' RETURNING id`,
+		a.OrganizationID, a.UserID, req.Command, req.CommandType, paramsJSON, req.FileName, req.FilePath, r.PathValue("id")).Scan(&id)
+	if err != nil {
+		writeError(w, 404, "device not found or offline")
+		return
+	}
+	_, _ = s.db.Exec(r.Context(), `INSERT INTO audit_logs (organization_id,user_id,device_id,action,resource,metadata) VALUES ($1,$2,$3,'rmm.task.created','rmm_task',jsonb_build_object('task_id',$4,'command_type',$5,'params',$6))`, a.OrganizationID, a.UserID, r.PathValue("id"), id, req.CommandType, paramsJSON)
+	writeJSON(w, 202, map[string]string{"task_id": id, "status": "QUEUED"})
+}
+func (s *server) agentFileContent(w http.ResponseWriter, r *http.Request) {
+	credential := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	var deviceID string
+	if err := s.db.QueryRow(r.Context(), "SELECT id FROM devices WHERE credential_hash=$1", hash(credential)).Scan(&deviceID); err != nil {
+		writeError(w, 401, "invalid device credential")
+		return
+	}
+	taskID := r.PathValue("id")
+	content, err := io.ReadAll(io.LimitReader(r.Body, 100<<20))
+	if err != nil {
+		writeError(w, 400, "unable to read file content")
+		return
+	}
+	result, err := s.db.Exec(r.Context(), `UPDATE commands SET file_content=$1, file_size=$2, completed_at=now(), status='SUCCESS' WHERE id=$3 AND device_id=$4 AND status='RUNNING'`, content, len(content), taskID, deviceID)
+	if err != nil || result.RowsAffected() != 1 {
+		writeError(w, 404, "command not found")
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "accepted"})
+}
+func (s *server) downloadRMMFile(w http.ResponseWriter, r *http.Request) {
+	a := r.Context().Value(authContextKey).(auth)
+	var fileName, filePath string
+	var fileContent []byte
+	var fileSize sql.NullInt64
+	err := s.db.QueryRow(r.Context(), `SELECT file_name, file_path, file_content, file_size FROM commands WHERE id=$1 AND device_id=$2 AND organization_id=$3 AND status='SUCCESS'`,
+		r.PathValue("taskId"), r.PathValue("id"), a.OrganizationID).Scan(&fileName, &filePath, &fileContent, &fileSize)
+	if err != nil {
+		writeError(w, 404, "file not found")
+		return
+	}
+	if len(fileContent) == 0 {
+		writeError(w, 404, "file content not available")
+		return
+	}
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
+	w.Header().Set("Content-Type", "application/octet-stream")
+	if fileSize.Valid {
+		w.Header().Set("Content-Length", strconv.FormatInt(fileSize.Int64, 10))
+	}
+	_, _ = w.Write(fileContent)
 }
 func (s *server) createRemoteSession(w http.ResponseWriter, r *http.Request) {
 	a := r.Context().Value(authContextKey).(auth)

@@ -209,8 +209,12 @@ func stageWindowsUpdate(executable, staged, api string) bool {
 }
 
 type commandJob struct {
-	ID      string `json:"id"`
-	Command string `json:"command,omitempty"`
+	ID          string         `json:"id"`
+	Command     string         `json:"command,omitempty"`
+	CommandType string         `json:"command_type,omitempty"`
+	Params      map[string]any `json:"params,omitempty"`
+	FileName    string         `json:"file_name,omitempty"`
+	FilePath    string         `json:"file_path,omitempty"`
 }
 
 func pollCommands(cfg config) {
@@ -218,11 +222,78 @@ func pollCommands(cfg config) {
 	if err := get(cfg.API+"/api/v1/agent/commands", cfg.Credential, &job); err != nil || job.ID == "" {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	result := executeRMMJob(cfg, job)
+	if result != nil {
+		_ = post(cfg.API+"/api/v1/agent/commands/"+job.ID+"/result", cfg.Credential, result, &map[string]any{})
+	}
+}
+
+func executeRMMJob(cfg config, job commandJob) *commandResult {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
+
+	switch job.CommandType {
+	case "powershell", "cmd", "bash":
+		return executeShellCommand(ctx, job)
+	case "execute_command", "execute_script":
+		return executeShellCommand(ctx, job)
+	case "kill_process":
+		return killProcess(ctx, job)
+	case "start_process":
+		return startProcess(ctx, job)
+	case "start_service":
+		return controlService(ctx, job, "start")
+	case "stop_service":
+		return controlService(ctx, job, "stop")
+	case "restart_service":
+		return controlService(ctx, job, "restart")
+	case "reboot":
+		return systemAction(ctx, job, "reboot")
+	case "shutdown":
+		return systemAction(ctx, job, "shutdown")
+	case "lock_workstation":
+		return systemAction(ctx, job, "lock")
+	case "logoff_user":
+		return systemAction(ctx, job, "logoff")
+	case "retrieve_file":
+		return retrieveFile(cfg, ctx, job)
+	case "upload_file":
+		return uploadFile(ctx, job)
+	case "delete_file":
+		return deleteFile(ctx, job)
+	case "rename_file":
+		return renameFile(ctx, job)
+	case "browse_filesystem":
+		return browseFilesystem(ctx, job)
+	default:
+		return &commandResult{ID: job.ID, Status: "FAILED", Stderr: "unknown command_type: " + job.CommandType}
+	}
+}
+
+func executeShellCommand(ctx context.Context, job commandJob) *commandResult {
 	name, args := "sh", []string{"-c", job.Command}
-	if runtime.GOOS == "windows" {
-		name, args = "powershell.exe", []string{"-NoProfile", "-NonInteractive", "-Command", job.Command}
+	switch job.CommandType {
+	case "powershell":
+		if runtime.GOOS == "windows" {
+			name = "powershell.exe"
+			args = []string{"-NoProfile", "-NonInteractive", "-Command", job.Command}
+		} else {
+			name = "sh"
+			args = []string{"-c", "pwsh -NoProfile -NonInteractive -Command '" + job.Command + "'"}
+		}
+	case "cmd":
+		if runtime.GOOS == "windows" {
+			name = "cmd.exe"
+			args = []string{"/C", job.Command}
+		}
+	case "bash":
+		name = "bash"
+		args = []string{"-c", job.Command}
+	default:
+		if runtime.GOOS == "windows" {
+			name = "powershell.exe"
+			args = []string{"-NoProfile", "-NonInteractive", "-Command", job.Command}
+		}
 	}
 	process := exec.CommandContext(ctx, name, args...)
 	output, err := process.CombinedOutput()
@@ -236,16 +307,242 @@ func pollCommands(cfg config) {
 	if exitErr, ok := err.(*exec.ExitError); ok {
 		code = exitErr.ExitCode()
 	}
-	result := commandResult{ID: job.ID, Status: status, ExitCode: &code, Stdout: string(output)}
-	_ = post(cfg.API+"/api/v1/agent/commands/"+job.ID+"/result", cfg.Credential, result, &map[string]any{})
+	return &commandResult{ID: job.ID, Status: status, ExitCode: &code, Stdout: string(output)}
+}
+
+func killProcess(ctx context.Context, job commandJob) *commandResult {
+	pid, _ := job.Params["pid"].(string)
+	name, _ := job.Params["name"].(string)
+	if pid == "" && name == "" {
+		return &commandResult{ID: job.ID, Status: "FAILED", Stderr: "pid or name is required"}
+	}
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		if pid != "" {
+			cmd = exec.CommandContext(ctx, "taskkill", "/PID", pid, "/F")
+		} else {
+			cmd = exec.CommandContext(ctx, "taskkill", "/IM", name, "/F")
+		}
+	} else {
+		if pid != "" {
+			cmd = exec.CommandContext(ctx, "kill", "-9", pid)
+		} else {
+			cmd = exec.CommandContext(ctx, "pkill", "-9", name)
+		}
+	}
+	output, err := cmd.CombinedOutput()
+	status := "SUCCESS"
+	if err != nil {
+		status = "FAILED"
+	}
+	return &commandResult{ID: job.ID, Status: status, Stdout: string(output), Stderr: fmt.Sprintf("%v", err)}
+}
+
+func startProcess(ctx context.Context, job commandJob) *commandResult {
+	path, _ := job.Params["path"].(string)
+	argsList, _ := job.Params["args"].([]interface{})
+	if path == "" {
+		return &commandResult{ID: job.ID, Status: "FAILED", Stderr: "path is required"}
+	}
+	var args []string
+	for _, a := range argsList {
+		if s, ok := a.(string); ok {
+			args = append(args, s)
+		}
+	}
+	cmd := exec.CommandContext(ctx, path, args...)
+	output, err := cmd.CombinedOutput()
+	status := "SUCCESS"
+	if err != nil {
+		status = "FAILED"
+	}
+	return &commandResult{ID: job.ID, Status: status, Stdout: string(output), Stderr: fmt.Sprintf("%v", err)}
+}
+
+func controlService(ctx context.Context, job commandJob, action string) *commandResult {
+	serviceName, _ := job.Params["service"].(string)
+	if serviceName == "" {
+		return &commandResult{ID: job.ID, Status: "FAILED", Stderr: "service name is required"}
+	}
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		switch action {
+		case "start":
+			cmd = exec.CommandContext(ctx, "net", "start", serviceName)
+		case "stop":
+			cmd = exec.CommandContext(ctx, "net", "stop", serviceName)
+		case "restart":
+			stopCmd := exec.CommandContext(ctx, "net", "stop", serviceName)
+			_, _ = stopCmd.CombinedOutput()
+			cmd = exec.CommandContext(ctx, "net", "start", serviceName)
+		}
+	} else {
+		cmd = exec.CommandContext(ctx, "systemctl", action, serviceName)
+	}
+	output, err := cmd.CombinedOutput()
+	status := "SUCCESS"
+	if err != nil {
+		status = "FAILED"
+	}
+	return &commandResult{ID: job.ID, Status: status, Stdout: string(output), Stderr: fmt.Sprintf("%v", err)}
+}
+
+func systemAction(ctx context.Context, job commandJob, action string) *commandResult {
+	delaySec, _ := job.Params["delay"].(float64)
+	delay := fmt.Sprintf("%d", int(delaySec))
+
+	var cmd *exec.Cmd
+	switch action {
+	case "reboot":
+		if runtime.GOOS == "windows" {
+			cmd = exec.CommandContext(ctx, "shutdown", "/r", "/t", delay)
+		} else {
+			cmd = exec.CommandContext(ctx, "reboot")
+		}
+	case "shutdown":
+		if runtime.GOOS == "windows" {
+			cmd = exec.CommandContext(ctx, "shutdown", "/s", "/t", delay)
+		} else {
+			cmd = exec.CommandContext(ctx, "shutdown", "-h", "+0")
+		}
+	case "lock":
+		if runtime.GOOS == "windows" {
+			cmd = exec.CommandContext(ctx, "rundll32.exe", "user32.dll,LockWorkStation")
+		} else {
+			return &commandResult{ID: job.ID, Status: "FAILED", Stderr: "lock_workstation not supported on Linux"}
+		}
+	case "logoff":
+		if runtime.GOOS == "windows" {
+			cmd = exec.CommandContext(ctx, "shutdown", "/l")
+		} else {
+			cmd = exec.CommandContext(ctx, "loginctl", "terminate-user", os.Getenv("USER"))
+		}
+	default:
+		return &commandResult{ID: job.ID, Status: "FAILED", Stderr: "unknown system action: " + action}
+	}
+	output, err := cmd.CombinedOutput()
+	status := "SUCCESS"
+	if err != nil {
+		status = "FAILED"
+	}
+	return &commandResult{ID: job.ID, Status: status, Stdout: string(output), Stderr: fmt.Sprintf("%v", err)}
+}
+
+func retrieveFile(cfg config, ctx context.Context, job commandJob) *commandResult {
+	filePath, _ := job.Params["path"].(string)
+	if filePath == "" {
+		return &commandResult{ID: job.ID, Status: "FAILED", Stderr: "path is required"}
+	}
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return &commandResult{ID: job.ID, Status: "FAILED", Stderr: err.Error()}
+	}
+	fileName := filepath.Base(filePath)
+	result := &commandResult{
+		ID:       job.ID,
+		Status:   "SUCCESS",
+		FileName: fileName,
+		FilePath: filePath,
+		FileSize: int64Ptr(int64(len(data))),
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.API+"/api/v1/agent/file-content/"+job.ID, bytes.NewReader(data))
+	if err != nil {
+		return &commandResult{ID: job.ID, Status: "FAILED", Stderr: err.Error()}
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Authorization", "Bearer "+cfg.Credential)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return &commandResult{ID: job.ID, Status: "FAILED", Stderr: err.Error()}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return &commandResult{ID: job.ID, Status: "FAILED", Stderr: "file upload failed"}
+	}
+	return result
+}
+
+func int64Ptr(v int64) *int64 { return &v }
+
+func uploadFile(ctx context.Context, job commandJob) *commandResult {
+	filePath, _ := job.Params["path"].(string)
+	content, _ := job.Params["content"].(string)
+	if filePath == "" {
+		return &commandResult{ID: job.ID, Status: "FAILED", Stderr: "path is required"}
+	}
+	if err := os.MkdirAll(filepath.Dir(filePath), 0700); err != nil {
+		return &commandResult{ID: job.ID, Status: "FAILED", Stderr: err.Error()}
+	}
+	if err := os.WriteFile(filePath, []byte(content), 0600); err != nil {
+		return &commandResult{ID: job.ID, Status: "FAILED", Stderr: err.Error()}
+	}
+	return &commandResult{ID: job.ID, Status: "SUCCESS", Stdout: "file written: " + filePath}
+}
+
+func deleteFile(ctx context.Context, job commandJob) *commandResult {
+	filePath, _ := job.Params["path"].(string)
+	if filePath == "" {
+		return &commandResult{ID: job.ID, Status: "FAILED", Stderr: "path is required"}
+	}
+	if err := os.Remove(filePath); err != nil {
+		return &commandResult{ID: job.ID, Status: "FAILED", Stderr: err.Error()}
+	}
+	return &commandResult{ID: job.ID, Status: "SUCCESS", Stdout: "deleted: " + filePath}
+}
+
+func renameFile(ctx context.Context, job commandJob) *commandResult {
+	oldPath, _ := job.Params["old_path"].(string)
+	newPath, _ := job.Params["new_path"].(string)
+	if oldPath == "" || newPath == "" {
+		return &commandResult{ID: job.ID, Status: "FAILED", Stderr: "old_path and new_path are required"}
+	}
+	if err := os.Rename(oldPath, newPath); err != nil {
+		return &commandResult{ID: job.ID, Status: "FAILED", Stderr: err.Error()}
+	}
+	return &commandResult{ID: job.ID, Status: "SUCCESS", Stdout: "renamed: " + oldPath + " -> " + newPath}
+}
+
+func browseFilesystem(ctx context.Context, job commandJob) *commandResult {
+	dirPath, _ := job.Params["path"].(string)
+	if dirPath == "" {
+		if runtime.GOOS == "windows" {
+			dirPath = "C:\\"
+		} else {
+			dirPath = "/"
+		}
+	}
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		return &commandResult{ID: job.ID, Status: "FAILED", Stderr: err.Error()}
+	}
+	result := []map[string]any{}
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		item := map[string]any{
+			"name":  entry.Name(),
+			"isDir": entry.IsDir(),
+			"size":  info.Size(),
+			"mode":  info.Mode().String(),
+			"modTime": info.ModTime().Format(time.RFC3339),
+		}
+		result = append(result, item)
+	}
+	output, _ := json.Marshal(result)
+	return &commandResult{ID: job.ID, Status: "SUCCESS", Stdout: string(output)}
 }
 
 type commandResult struct {
-	ID       string `json:"id"`
-	Status   string `json:"status"`
-	ExitCode *int   `json:"exit_code,omitempty"`
-	Stdout   string `json:"stdout"`
-	Stderr   string `json:"stderr"`
+	ID          string `json:"id"`
+	Status      string `json:"status"`
+	ExitCode    *int   `json:"exit_code,omitempty"`
+	Stdout      string `json:"stdout"`
+	Stderr      string `json:"stderr"`
+	FileName    string `json:"file_name,omitempty"`
+	FilePath    string `json:"file_path,omitempty"`
+	FileSize    *int64 `json:"file_size,omitempty"`
 }
 
 func get(url, credential string, response any) error {

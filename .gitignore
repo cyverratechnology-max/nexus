@@ -10,3 +10,4 @@ bin/
 backend/bin/
 agent/bin/
 *.log
+*.exe
