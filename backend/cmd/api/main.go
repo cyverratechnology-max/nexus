@@ -182,6 +182,11 @@ func main() {
 	mux.HandleFunc("PUT /api/v1/devices/{id}/unattended", s.requireUser(s.toggleUnattendedAccess))
 	mux.HandleFunc("GET /api/v1/devices/unattended", s.requireUser(s.listUnattendedDevices))
 	mux.HandleFunc("POST /api/v1/unattended/validate", s.validateUnattendedToken)
+	mux.HandleFunc("GET /api/v1/meshcentral/config", s.requireUser(s.getMeshCentralConfig))
+	mux.HandleFunc("PUT /api/v1/meshcentral/config", s.requireUser(s.updateMeshCentralConfig))
+	mux.HandleFunc("GET /api/v1/meshcentral/devices", s.requireUser(s.listMeshCentralDevices))
+	mux.HandleFunc("POST /api/v1/meshcentral/sync", s.requireUser(s.syncMeshCentralDevices))
+	mux.HandleFunc("/meshcentral/", s.requireUser(s.meshCentralProxy))
 	handler := s.cors(s.requestID(mux))
 	addr := env("API_ADDR", ":8443")
 	certFile := env("TLS_CERT_FILE", "")
@@ -1008,6 +1013,200 @@ func (s *server) listAuditLogs(w http.ResponseWriter, r *http.Request) {
 		result = append(result, item)
 	}
 	writeJSON(w, 200, map[string]any{"data": result})
+}
+
+func (s *server) getMeshCentralConfig(w http.ResponseWriter, r *http.Request) {
+	a := r.Context().Value(authContextKey).(auth)
+	if a.Role != "platform_admin" && a.Role != "org_admin" {
+		writeError(w, 403, "insufficient permission")
+		return
+	}
+	var serverURL, apiKey, agentGroup string
+	var enabled bool
+	var syncInterval int
+	var lastSync sql.NullTime
+	err := s.db.QueryRow(r.Context(), `SELECT server_url, api_key, agent_group, enabled, sync_interval, last_sync_at FROM meshcentral_config WHERE id='default'`).Scan(&serverURL, &apiKey, &agentGroup, &enabled, &syncInterval, &lastSync)
+	if err != nil {
+		writeError(w, 500, "unable to read config")
+		return
+	}
+	resp := map[string]any{"server_url": serverURL, "api_key": apiKey, "agent_group": agentGroup, "enabled": enabled, "sync_interval": syncInterval}
+	if lastSync.Valid { resp["last_sync_at"] = lastSync.Time }
+	writeJSON(w, 200, resp)
+}
+
+func (s *server) updateMeshCentralConfig(w http.ResponseWriter, r *http.Request) {
+	a := r.Context().Value(authContextKey).(auth)
+	if a.Role != "platform_admin" && a.Role != "org_admin" {
+		writeError(w, 403, "insufficient permission")
+		return
+	}
+	var req struct {
+		ServerURL    string `json:"server_url"`
+		APIKey       string `json:"api_key"`
+		AgentGroup   string `json:"agent_group"`
+		Enabled      bool   `json:"enabled"`
+		SyncInterval int    `json:"sync_interval"`
+	}
+	if !decode(r, &req) {
+		writeError(w, 400, "invalid request")
+		return
+	}
+	if req.SyncInterval < 10 { req.SyncInterval = 60 }
+	_, err := s.db.Exec(r.Context(), `UPDATE meshcentral_config SET server_url=$1, api_key=$2, agent_group=$3, enabled=$4, sync_interval=$5, updated_at=now() WHERE id='default'`,
+		req.ServerURL, req.APIKey, req.AgentGroup, req.Enabled, req.SyncInterval)
+	if err != nil {
+		writeError(w, 500, "unable to update config")
+		return
+	}
+	_, _ = s.db.Exec(r.Context(), `INSERT INTO audit_logs (organization_id,user_id,device_id,action,resource,metadata) VALUES ($1,$2,'','meshcentral.config.updated','meshcentral_config',jsonb_build_object('enabled',$3))`, a.OrganizationID, a.UserID, req.Enabled)
+	writeJSON(w, 200, map[string]string{"status": "updated"})
+}
+
+func (s *server) listMeshCentralDevices(w http.ResponseWriter, r *http.Request) {
+	a := r.Context().Value(authContextKey).(auth)
+	rows, err := s.db.Query(r.Context(), `SELECT mc_id, name, host, ip, domain, agent_version, platform, state, last_seen, nexus_device_id FROM meshcentral_devices WHERE organization_id=$1 ORDER BY name`, a.OrganizationID)
+	if err != nil {
+		writeError(w, 500, "unable to list devices")
+		return
+	}
+	defer rows.Close()
+	result := []map[string]any{}
+	for rows.Next() {
+		var mcID int
+		var name, host, ip, domain, platformStr string
+		var agentVer int
+		var state int
+		var lastSeen sql.NullTime
+		var nexusID sql.NullString
+		if err := rows.Scan(&mcID, &name, &host, &ip, &domain, &agentVer, &platformStr, &state, &lastSeen, &nexusID); err != nil {
+			continue
+		}
+		item := map[string]any{"mc_id": mcID, "name": name, "host": host, "ip": ip, "domain": domain, "agent_version": agentVer, "platform": platformStr, "state": state}
+		if lastSeen.Valid { item["last_seen"] = lastSeen.Time }
+		if nexusID.Valid { item["nexus_device_id"] = nexusID.String }
+		result = append(result, item)
+	}
+	writeJSON(w, 200, map[string]any{"data": result})
+}
+
+func (s *server) syncMeshCentralDevices(w http.ResponseWriter, r *http.Request) {
+	a := r.Context().Value(authContextKey).(auth)
+	if a.Role != "platform_admin" && a.Role != "org_admin" {
+		writeError(w, 403, "insufficient permission")
+		return
+	}
+	var serverURL, apiKey string
+	err := s.db.QueryRow(r.Context(), `SELECT server_url, api_key FROM meshcentral_config WHERE id='default' AND enabled=true`).Scan(&serverURL, &apiKey)
+	if err != nil || serverURL == "" {
+		writeError(w, 400, "MeshCentral not configured or disabled")
+		return
+	}
+	mcDevices, err := fetchMeshCentralDevices(serverURL, apiKey)
+	if err != nil {
+		writeError(w, 502, "failed to fetch from MeshCentral: "+err.Error())
+		return
+	}
+	synced := 0
+	for _, d := range mcDevices {
+		_, _ = s.db.Exec(r.Context(), `INSERT INTO meshcentral_devices (mc_id, name, host, ip, domain, agent_version, platform, state, mesh_id, organization_id, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now())
+			ON CONFLICT (mc_id) DO UPDATE SET name=$2, host=$3, ip=$4, domain=$5, agent_version=$6, platform=$7, state=$8, updated_at=now()`,
+			d["id"], d["name"], d["host"], d["ip"], d["domain"], d["agentVersion"], d["platform"], d["state"], d["meshId"], a.OrganizationID)
+		synced++
+	}
+	_, _ = s.db.Exec(r.Context(), `UPDATE meshcentral_config SET last_sync_at=now(), updated_at=now() WHERE id='default'`)
+	_, _ = s.db.Exec(r.Context(), `INSERT INTO audit_logs (organization_id,user_id,device_id,action,resource,metadata) VALUES ($1,$2,'','meshcentral.sync.completed','meshcentral_config',jsonb_build_object('synced',$3))`, a.OrganizationID, a.UserID, synced)
+	writeJSON(w, 200, map[string]any{"synced": synced})
+}
+
+func fetchMeshCentralDevices(serverURL, apiKey string) ([]map[string]any, error) {
+	url := strings.TrimRight(serverURL, "/") + "/api/devices?apikey=" + apiKey
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
+	}
+	var apiResp struct {
+		Results []struct {
+			ID           int    `json:"id"`
+			Name         string `json:"name"`
+			Host         string `json:"host"`
+			IP           string `json:"ip"`
+			Domain       string `json:"domain"`
+			AgentVersion int    `json:"agentVersion"`
+			Platform     int    `json:"platform"`
+			State        int    `json:"state"`
+			MeshID       string `json:"meshid"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+		return nil, err
+	}
+	devices := make([]map[string]any, 0, len(apiResp.Results))
+	for _, d := range apiResp.Results {
+		platformStr := "unknown"
+		switch d.Platform {
+		case 1: platformStr = "windows"
+		case 2: platformStr = "linux"
+		case 3: platformStr = "macos"
+		}
+		devices = append(devices, map[string]any{
+			"id": d.ID, "name": d.Name, "host": d.Host, "ip": d.IP,
+			"domain": d.Domain, "agentVersion": d.AgentVersion,
+			"platform": platformStr, "state": d.State, "meshId": d.MeshID,
+		})
+	}
+	return devices, nil
+}
+
+func (s *server) meshCentralProxy(w http.ResponseWriter, r *http.Request) {
+	a := r.Context().Value(authContextKey).(auth)
+	if a.Role != "platform_admin" && a.Role != "org_admin" && a.Role != "technician" {
+		writeError(w, 403, "insufficient permission")
+		return
+	}
+	var serverURL, apiKey string
+	err := s.db.QueryRow(r.Context(), `SELECT server_url, api_key FROM meshcentral_config WHERE id='default' AND enabled=true`).Scan(&serverURL, &apiKey)
+	if err != nil || serverURL == "" {
+		writeError(w, 400, "MeshCentral not configured")
+		return
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/meshcentral")
+	targetURL := strings.TrimRight(serverURL, "/") + path
+	if r.URL.RawQuery != "" {
+		targetURL += "?" + r.URL.RawQuery
+	}
+	if apiKey != "" {
+		sep := "?"
+		if strings.Contains(targetURL, "?") { sep = "&" }
+		targetURL += sep + "apikey=" + apiKey
+	}
+	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
+	if err != nil {
+		writeError(w, 500, "proxy error")
+		return
+	}
+	proxyReq.Header.Set("Content-Type", r.Header.Get("Content-Type"))
+	proxyReq.Header.Set("Accept", r.Header.Get("Accept"))
+	client := &http.Client{Timeout: 30 * time.Second}
+	proxyResp, err := client.Do(proxyReq)
+	if err != nil {
+		writeError(w, 502, "MeshCentral unreachable")
+		return
+	}
+	defer proxyResp.Body.Close()
+	for key, values := range proxyResp.Header {
+		for _, v := range values {
+			w.Header().Add(key, v)
+		}
+	}
+	w.WriteHeader(proxyResp.StatusCode)
+	io.Copy(w, proxyResp.Body)
 }
 
 func (s *server) generateUnattendedToken(w http.ResponseWriter, r *http.Request) {

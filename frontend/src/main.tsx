@@ -13,6 +13,7 @@ type View = 'dashboard' | 'devices-all' | 'devices-windows' | 'devices-linux' | 
   | 'network-discovery' | 'network-snmp' | 'network-devices'
   | 'reports' | 'audit'
   | 'admin-orgs' | 'admin-sites' | 'admin-users' | 'admin-roles' | 'admin-api' | 'admin-integrations' | 'admin-settings'
+  | 'meshcentral' | 'meshcentral-settings'
 
 type Device = { id: string; hostname: string; platform: string; os_name: string; os_version: string; status: string; agent_version: string; last_seen?: string }
 type Metric = { device_id?: string; hostname?: string; status?: string; cpu_percent?: number; memory_used_bytes?: number; memory_total_bytes?: number; collected_at?: string }
@@ -44,6 +45,10 @@ const NAV_GROUPS: NavGroup[] = [
     { key: 'remote-terminal', label: 'Terminal', icon: '>' },
     { key: 'remote-desktop', label: 'Desktop', icon: '▢' },
     { key: 'remote-files', label: 'File Manager', icon: '/' },
+  ]},
+  { title: 'MESHCENTRAL', items: [
+    { key: 'meshcentral', label: 'Devices', icon: '⊞' },
+    { key: 'meshcentral-settings', label: 'Settings', icon: '⚙' },
   ]},
   { title: 'SOFTWARE', items: [
     { key: 'software-inventory', label: 'Inventory', icon: '◻' },
@@ -215,6 +220,8 @@ function getPageDescription(view: View): string {
     'admin-api': 'API keys and access management.',
     'admin-integrations': 'Third-party integrations.',
     'admin-settings': 'System configuration and settings.',
+    'meshcentral': 'MeshCentral managed devices — remote desktop, terminal, files.',
+    'meshcentral-settings': 'Configure MeshCentral server connection.',
   }
   return descriptions[view] || ''
 }
@@ -263,6 +270,8 @@ function renderContent(view: View, ctx: { devices: Device[]; metrics: Metric[]; 
     case 'admin-api': return <ComingSoon module="API Management" />
     case 'admin-integrations': return <ComingSoon module="Integrations" />
     case 'admin-settings': return <ComingSoon module="System Settings" />
+    case 'meshcentral': return <MeshCentralPage />
+    case 'meshcentral-settings': return <MeshCentralSettingsPage />
     default: return <ComingSoon module="Module" />
   }
 }
@@ -919,6 +928,165 @@ function Info({ label, value }: { label: string; value: string }) { return <div>
 function Stat({ label, value, tone }: { label: string; value: string | number; tone: string }) { return <div className={`stat ${tone}`}><span>{label}</span><strong>{value}</strong><i /></div> }
 function Empty({ onAdd }: { onAdd: () => void }) { return <div className="empty"><strong>No devices</strong><span>Create an enrollment token and install the agent.</span><button onClick={onAdd}>+ Add device</button></div> }
 function formatBytes(v?: number) { if (!v) return '--'; const u = ['B', 'KB', 'MB', 'GB', 'TB']; let s = v; let i = 0; while (s >= 1024 && i < u.length - 1) { s /= 1024; i++ } return `${s.toFixed(i ? 1 : 0)} ${u[i]}` }
+
+function MeshCentralPage() {
+  const [devices, setDevices] = useState<any[]>([])
+  const [loading, setLoading] = useState(true)
+  const [syncing, setSyncing] = useState(false)
+  const [msg, setMsg] = useState('')
+  const [config, setConfig] = useState<any>(null)
+
+  const load = async () => {
+    setLoading(true)
+    const r = await fetch(`${API}/api/v1/meshcentral/config`, { headers: authHeaders() })
+    if (r.ok) setConfig(await r.json())
+    const r2 = await fetch(`${API}/api/v1/meshcentral/devices`, { headers: authHeaders() })
+    if (r2.ok) setDevices((await r2.json()).data || [])
+    setLoading(false)
+  }
+
+  useEffect(() => { load() }, [])
+
+  const sync = async () => {
+    setSyncing(true); setMsg('')
+    const r = await fetch(`${API}/api/v1/meshcentral/sync`, { method: 'POST', headers: authHeaders() })
+    const b = await r.json()
+    if (r.ok) { setMsg(`Synced ${b.synced} devices from MeshCentral`); load() }
+    else setMsg(b.error?.message ?? 'Sync failed')
+    setSyncing(false)
+  }
+
+  const openMC = (path: string) => {
+    if (!config?.server_url) return
+    window.open(`${config.server_url}${path}`, '_blank')
+  }
+
+  if (!config?.enabled) {
+    return (
+      <div className="mc-disabled">
+        <div className="mc-disabled-icon">⊞</div>
+        <h3>MeshCentral Integration</h3>
+        <p>Connect your MeshCentral server to manage devices with native remote desktop, terminal, and file access.</p>
+        <p className="mc-disabled-hint">Configure the server URL and API key in Settings first.</p>
+      </div>
+    )
+  }
+
+  return (
+    <div className="mc-layout">
+      <div className="mc-toolbar">
+        <div className="mc-toolbar-info">
+          <span className="mc-badge mc-badge-active">Connected</span>
+          <span className="mc-server-url">{config.server_url}</span>
+          {config.last_sync_at && <span className="mc-last-sync">Last sync: {new Date(config.last_sync_at).toLocaleString()}</span>}
+        </div>
+        <div className="mc-toolbar-actions">
+          <button className="mc-btn mc-btn-secondary" onClick={sync} disabled={syncing}>{syncing ? 'Syncing...' : '↻ Sync Devices'}</button>
+          <button className="mc-btn mc-btn-primary" onClick={() => openMC('/')}>Open MeshCentral</button>
+        </div>
+      </div>
+      {msg && <div className="mc-toast">{msg}<button onClick={() => setMsg('')}>×</button></div>}
+      <div className="mc-devices-grid">
+        <div className="mc-grid-header">
+          <span className="mc-col-name">Device Name</span>
+          <span className="mc-col-host">Hostname</span>
+          <span className="mc-col-ip">IP Address</span>
+          <span className="mc-col-platform">Platform</span>
+          <span className="mc-col-state">State</span>
+          <span className="mc-col-actions">Actions</span>
+        </div>
+        {loading ? (
+          <div className="mc-loading">Loading devices...</div>
+        ) : devices.length === 0 ? (
+          <div className="mc-empty">
+            <p>No MeshCentral devices found.</p>
+            <p>Click "Sync Devices" to import from your MeshCentral server.</p>
+          </div>
+        ) : devices.map((d: any) => (
+          <div className="mc-grid-row" key={d.mc_id}>
+            <span className="mc-col-name"><strong>{d.name}</strong></span>
+            <span className="mc-col-host">{d.host || '--'}</span>
+            <span className="mc-col-ip">{d.ip || '--'}</span>
+            <span className="mc-col-platform"><span className={`mc-platform mc-platform-${d.platform}`}>{d.platform}</span></span>
+            <span className="mc-col-state"><span className={`mc-state mc-state-${d.state === 1 ? 'online' : 'offline'}`}>{d.state === 1 ? 'Online' : 'Offline'}</span></span>
+            <span className="mc-col-actions">
+              <button className="mc-btn mc-btn-sm" onClick={() => openMC(`/mesh.aspx?id=${d.mc_id}`)} title="Open in MeshCentral">⊞</button>
+              <button className="mc-btn mc-btn-sm" onClick={() => openMC(`/meshdesktop.aspx?id=${d.mc_id}`)} title="Remote Desktop">▢</button>
+              <button className="mc-btn mc-btn-sm" onClick={() => openMC(`/meshshell.aspx?id=${d.mc_id}`)} title="Terminal">{`>`}</button>
+              <button className="mc-btn mc-btn-sm" onClick={() => openMC(`/meshfiles.aspx?id=${d.mc_id}`)} title="File Manager">/</button>
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function MeshCentralSettingsPage() {
+  const [config, setConfig] = useState({ server_url: '', api_key: '', agent_group: '', enabled: false, sync_interval: 60 })
+  const [msg, setMsg] = useState('')
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    fetch(`${API}/api/v1/meshcentral/config`, { headers: authHeaders() }).then(r => r.ok ? r.json() : null).then(d => { if (d) setConfig(d) })
+  }, [])
+
+  const save = async () => {
+    setSaving(true); setMsg('')
+    const r = await fetch(`${API}/api/v1/meshcentral/config`, { method: 'PUT', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify(config) })
+    const b = await r.json()
+    if (r.ok) setMsg('Configuration saved.')
+    else setMsg(b.error?.message ?? 'Failed to save')
+    setSaving(false)
+  }
+
+  return (
+    <div className="mc-settings">
+      <div className="mc-settings-card">
+        <h3>MeshCentral Server Connection</h3>
+        <p>Configure the MeshCentral server to enable remote desktop, terminal, and file management through NEXUS.</p>
+        <div className="mc-form">
+          <label className="mc-field">
+            <span>Server URL</span>
+            <input value={config.server_url} onChange={e => setConfig({ ...config, server_url: e.target.value })} placeholder="https://mesh.example.com" />
+          </label>
+          <label className="mc-field">
+            <span>API Key</span>
+            <input value={config.api_key} onChange={e => setConfig({ ...config, api_key: e.target.value })} placeholder="API key from MeshCentral" type="password" />
+          </label>
+          <label className="mc-field">
+            <span>Agent Group (Mesh ID)</span>
+            <input value={config.agent_group} onChange={e => setConfig({ ...config, agent_group: e.target.value })} placeholder="Mesh ID for device group" />
+          </label>
+          <label className="mc-field">
+            <span>Sync Interval (seconds)</span>
+            <input type="number" value={config.sync_interval} onChange={e => setConfig({ ...config, sync_interval: parseInt(e.target.value) || 60 })} min={10} />
+          </label>
+          <label className="mc-toggle">
+            <input type="checkbox" checked={config.enabled} onChange={e => setConfig({ ...config, enabled: e.target.checked })} />
+            <span>Enable MeshCentral Integration</span>
+          </label>
+        </div>
+        {msg && <div className="mc-msg">{msg}</div>}
+        <div className="mc-form-actions">
+          <button className="mc-btn mc-btn-primary" onClick={save} disabled={saving}>{saving ? 'Saving...' : 'Save Configuration'}</button>
+        </div>
+        <div className="mc-help">
+          <h4>Setup Instructions</h4>
+          <ol>
+            <li>Install MeshCentral server (Node.js required)</li>
+            <li>Generate an API key in MeshCentral Server Settings</li>
+            <li>Enter the server URL and API key above</li>
+            <li>Enable the integration and save</li>
+            <li>Go to MeshCentral → Devices and click "Sync Devices"</li>
+          </ol>
+          <p>Both NEXUS agent and MeshCentral agent can run side by side on the same device for full management capabilities.</p>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function Login({ onSuccess }: { onSuccess: () => void }) {
   const [email, setEmail] = useState('admin@cyverra.local'); const [password, setPassword] = useState(''); const [error, setError] = useState('')
   const submit = async (e: FormEvent) => { e.preventDefault(); const r = await fetch(`${API}/api/v1/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password }) }); const b = await r.json(); if (!r.ok) { setError(b.error?.message ?? 'Failed'); return } localStorage.setItem('token', b.token); onSuccess() }
