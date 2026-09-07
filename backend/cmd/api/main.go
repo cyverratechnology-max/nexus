@@ -1139,62 +1139,68 @@ func (s *server) syncMeshCentralDevices(w http.ResponseWriter, r *http.Request) 
 }
 
 func fetchMeshCentralDevices(serverURL, apiKey string) ([]map[string]any, error) {
-	meshListURL := strings.TrimRight(serverURL, "/") + "/meshsettings?apikey=" + apiKey
-	client := &http.Client{Timeout: 15 * time.Second, Transport: &http.Transport{TLSClientConfig: skipTLSVerify()}}
-	resp, err := client.Get(meshListURL)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	dataDir := env("MESHCENTRAL_DATA_DIR", "/meshcentral-data")
+	return readMeshCentralNeDB(dataDir)
+}
 
-	var meshResp struct {
-		Meshes []struct {
-			ID   string `json:"_id"`
-			Name string `json:"name"`
-		} `json:"meshes"`
+func readMeshCentralNeDB(dataDir string) ([]map[string]any, error) {
+	nodesFile := dataDir + "/nodes.db"
+	meshesFile := dataDir + "/meshes.db"
+
+	meshNames := map[string]string{}
+	if data, err := os.ReadFile(meshesFile); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "ewe{") {
+				continue
+			}
+			var mesh struct {
+				ID   string `json:"_id"`
+				Name string `json:"name"`
+			}
+			if json.Unmarshal([]byte(line), &mesh) == nil && mesh.ID != "" {
+				meshNames[mesh.ID] = mesh.Name
+			}
+		}
 	}
-	if err := json.Unmarshal(body, &meshResp); err != nil {
-		return nil, fmt.Errorf("parse error: %v body: %s", err, string(body[:min(len(body), 200)]))
+
+	data, err := os.ReadFile(nodesFile)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read %s: %v", nodesFile, err)
 	}
 
 	devices := []map[string]any{}
-	for _, mesh := range meshResp.Meshes {
-		nodeURL := strings.TrimRight(serverURL, "/") + "/meshsettings?apikey=" + apiKey + "&id=" + mesh.ID
-		nodeResp, err := client.Get(nodeURL)
-		if err != nil {
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "ewe{") {
 			continue
 		}
-		nodeBody, _ := io.ReadAll(io.LimitReader(nodeResp.Body, 1<<20))
-		nodeResp.Body.Close()
-
-		var nodes struct {
-			Nodes []struct {
-				ID           string `json:"_id"`
-				Name         string `json:"name"`
-				Host         string `json:"host"`
-				IP           string `json:"ip"`
-				AgentVersion int    `json:"agentVer"`
-				Platform     int    `json:"platform"`
-				State        int    `json:"state"`
-			} `json:"nodes"`
+		var node struct {
+			ID           string `json:"_id"`
+			Name         string `json:"name"`
+			Host         string `json:"host"`
+			IP           string `json:"ip"`
+			MeshID       string `json:"meshid"`
+			AgentVersion int    `json:"agentVer"`
+			Platform     int    `json:"platform"`
+			State        int    `json:"lastconnect"`
 		}
-		if err := json.Unmarshal(nodeBody, &nodes); err != nil {
+		if json.Unmarshal([]byte(line), &node) != nil || node.ID == "" {
 			continue
 		}
-		for _, n := range nodes.Nodes {
-			platformStr := "unknown"
-			switch n.Platform {
-			case 1: platformStr = "windows"
-			case 2: platformStr = "linux"
-			case 3: platformStr = "macos"
-			}
-			devices = append(devices, map[string]any{
-				"id": n.ID, "name": n.Name, "host": n.Host, "ip": n.IP,
-				"domain": "", "agentVersion": n.AgentVersion,
-				"platform": platformStr, "state": n.State, "meshId": mesh.ID,
-			})
+		platformStr := "unknown"
+		switch node.Platform {
+		case 1: platformStr = "windows"
+		case 2: platformStr = "linux"
+		case 3: platformStr = "macos"
 		}
+		state := 0
+		if node.State > 0 { state = 1 }
+		devices = append(devices, map[string]any{
+			"id": node.ID, "name": node.Name, "host": node.Host, "ip": node.IP,
+			"domain": "", "agentVersion": node.AgentVersion,
+			"platform": platformStr, "state": state, "meshId": node.MeshID,
+		})
 	}
 	return devices, nil
 }
