@@ -681,13 +681,15 @@ func ensureMCAgentRunning(bin string, cfg *mcConfigData) {
 	wssURL := strings.Replace(mcURL, "https://", "wss://", 1)
 	wssURL = strings.Replace(wssURL, "http://", "ws://", 1)
 
+	binDir := filepath.Dir(bin)
+	mshPath := filepath.Join(binDir, filepath.Base(bin)+".msh")
 	mshContent := fmt.Sprintf("MeshServer=%s\nMeshID=%s\n", wssURL, cfg.AgentGroup)
-	mshPath := bin + ".msh"
 	os.WriteFile(mshPath, []byte(mshContent), 0600)
 	logMessage("meshcentral .msh file written: " + mshPath)
 	logMessage("meshcentral .msh content: MeshServer=" + wssURL + " MeshID=" + cfg.AgentGroup)
 
-	cmd := exec.Command(bin, "--mshfile", mshPath)
+	cmd := exec.Command(bin)
+	cmd.Dir = binDir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
