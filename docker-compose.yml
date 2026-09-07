@@ -31,6 +31,6 @@ services:
       postgres:
         condition: service_healthy
     volumes:
-      - /opt/meshcentral-data:/meshcentral-data:ro
+      - /opt/MeshCentral/data:/meshcentral-data:ro
 volumes:
   postgres-data:

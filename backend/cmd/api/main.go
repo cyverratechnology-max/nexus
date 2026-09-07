@@ -1144,63 +1144,53 @@ func fetchMeshCentralDevices(serverURL, apiKey string) ([]map[string]any, error)
 }
 
 func readMeshCentralNeDB(dataDir string) ([]map[string]any, error) {
-	nodesFile := dataDir + "/nodes.db"
-	meshesFile := dataDir + "/meshes.db"
+	dbFile := dataDir + "/meshcentral.db"
+	data, err := os.ReadFile(dbFile)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read %s: %v", dbFile, err)
+	}
 
 	meshNames := map[string]string{}
-	if data, err := os.ReadFile(meshesFile); err == nil {
-		for _, line := range strings.Split(string(data), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" || strings.HasPrefix(line, "ewe{") {
-				continue
-			}
-			var mesh struct {
-				ID   string `json:"_id"`
-				Name string `json:"name"`
-			}
-			if json.Unmarshal([]byte(line), &mesh) == nil && mesh.ID != "" {
-				meshNames[mesh.ID] = mesh.Name
-			}
-		}
-	}
-
-	data, err := os.ReadFile(nodesFile)
-	if err != nil {
-		return nil, fmt.Errorf("cannot read %s: %v", nodesFile, err)
-	}
-
 	devices := []map[string]any{}
+
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "ewe{") {
+		if line == "" || strings.HasPrefix(line, "{") == false {
 			continue
 		}
-		var node struct {
-			ID           string `json:"_id"`
-			Name         string `json:"name"`
-			Host         string `json:"host"`
-			IP           string `json:"ip"`
-			MeshID       string `json:"meshid"`
-			AgentVersion int    `json:"agentVer"`
-			Platform     int    `json:"platform"`
-			State        int    `json:"lastconnect"`
-		}
-		if json.Unmarshal([]byte(line), &node) != nil || node.ID == "" {
+		var record map[string]any
+		if json.Unmarshal([]byte(line), &record) != nil {
 			continue
 		}
-		platformStr := "unknown"
-		switch node.Platform {
-		case 1: platformStr = "windows"
-		case 2: platformStr = "linux"
-		case 3: platformStr = "macos"
+		recordType, _ := record["type"].(string)
+		switch recordType {
+		case "mesh":
+			id, _ := record["_id"].(string)
+			name, _ := record["name"].(string)
+			meshNames[id] = name
+		case "node":
+			id, _ := record["_id"].(string)
+			name, _ := record["name"].(string)
+			host, _ := record["host"].(string)
+			ip, _ := record["ip"].(string)
+			meshID, _ := record["meshid"].(string)
+			agentVer, _ := record["agentVer"].(float64)
+			platform, _ := record["platform"].(float64)
+			lastConn, _ := record["lastconnect"].(float64)
+			state := 0
+			if lastConn > 0 { state = 1 }
+			platformStr := "unknown"
+			switch int(platform) {
+			case 1: platformStr = "windows"
+			case 2: platformStr = "linux"
+			case 3: platformStr = "macos"
+			}
+			devices = append(devices, map[string]any{
+				"id": id, "name": name, "host": host, "ip": ip,
+				"domain": "", "agentVersion": int(agentVer),
+				"platform": platformStr, "state": state, "meshId": meshID,
+			})
 		}
-		state := 0
-		if node.State > 0 { state = 1 }
-		devices = append(devices, map[string]any{
-			"id": node.ID, "name": node.Name, "host": node.Host, "ip": node.IP,
-			"domain": "", "agentVersion": node.AgentVersion,
-			"platform": platformStr, "state": state, "meshId": node.MeshID,
-		})
 	}
 	return devices, nil
 }
