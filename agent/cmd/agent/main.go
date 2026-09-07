@@ -509,6 +509,7 @@ func handleKeyboard(key string, down bool) {
 func manageMeshCentralAgent(cfg config) {
 	mcConfig := fetchMCConfig(cfg)
 	if mcConfig == nil || !mcConfig.Enabled || mcConfig.ServerURL == "" {
+		logMessage("meshcentral integration disabled or no server url")
 		return
 	}
 	logMessage("meshcentral integration enabled, managing MC agent")
@@ -516,11 +517,12 @@ func manageMeshCentralAgent(cfg config) {
 	mcBin := findMCAgentBinary()
 	if mcBin == "" {
 		logMessage("meshcentral agent not found, attempting download...")
-		if err := downloadMCAgent(mcConfig); err != nil {
+		downloaded, err := downloadMCAgent(mcConfig)
+		if err != nil {
 			logMessage("meshcentral agent download failed: " + err.Error())
 			return
 		}
-		mcBin = findMCAgentBinary()
+		mcBin = downloaded
 	}
 	if mcBin == "" {
 		logMessage("meshcentral agent binary not found after download")
@@ -555,17 +557,43 @@ func fetchMCConfig(cfg config) *mcConfigData {
 }
 
 var mcAgentProcess *os.Process
+var mcAgentPID int
+
+func isMCAgentAlive() bool {
+	if mcAgentProcess == nil {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		out, err := exec.Command("tasklist", "/FI", "PID eq "+strconv.Itoa(mcAgentPID), "/NH").Output()
+		if err != nil {
+			return false
+		}
+		return strings.Contains(string(out), strconv.Itoa(mcAgentPID))
+	} else {
+		return mcAgentProcess.Signal(syscall.Signal(0)) == nil
+	}
+}
 
 func findMCAgentBinary() string {
+	installDir := filepath.Join(os.TempDir(), ".cyverra")
+	if runtime.GOOS == "windows" {
+		p := filepath.Join(installDir, "meshagent.exe")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	} else {
+		p := filepath.Join(installDir, "meshagent")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
 	paths := []string{
 		"/usr/local/bin/meshagent",
 		"/usr/bin/meshagent",
-		filepath.Join(os.TempDir(), "meshagent"),
 	}
 	if runtime.GOOS == "windows" {
 		paths = []string{
 			filepath.Join(os.Getenv("ProgramFiles"), "MeshCentral", "meshagent.exe"),
-			filepath.Join(os.TempDir(), "meshagent.exe"),
 			"C:\\Program Files\\MeshCentral\\meshagent.exe",
 		}
 	}
@@ -577,7 +605,7 @@ func findMCAgentBinary() string {
 	return ""
 }
 
-func downloadMCAgent(cfg *mcConfigData) error {
+func downloadMCAgent(cfg *mcConfigData) (string, error) {
 	arch := "4"
 	if runtime.GOARCH == "arm64" {
 		arch = "25"
@@ -593,62 +621,66 @@ func downloadMCAgent(cfg *mcConfigData) error {
 		}
 	}
 
+	suffix := ""
+	if runtime.GOOS == "windows" {
+		suffix = ".exe"
+	}
+
+	installDir := filepath.Join(os.TempDir(), ".cyverra")
+	os.MkdirAll(installDir, 0755)
+	dest := filepath.Join(installDir, "meshagent"+suffix)
+
+	if _, err := os.Stat(dest); err == nil {
+		logMessage("meshcentral agent already downloaded: " + dest)
+		return dest, nil
+	}
+
 	url := strings.TrimRight(cfg.ServerURL, "/") + "/meshagents?id=" + arch
 	if cfg.AgentGroup != "" {
 		url += "&meshid=" + cfg.AgentGroup
 	}
 
-	var dest string
-	if runtime.GOOS == "windows" {
-		dest = filepath.Join(os.TempDir(), "meshagent.exe")
-	} else {
-		dest = filepath.Join(os.TempDir(), "meshagent")
-	}
-
 	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return fmt.Errorf("download returned status %d", resp.StatusCode)
+		return "", fmt.Errorf("download returned status %d", resp.StatusCode)
 	}
 
 	f, err := os.Create(dest)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer f.Close()
 	if _, err := io.Copy(f, resp.Body); err != nil {
-		return err
+		return "", err
 	}
 	if runtime.GOOS != "windows" {
 		os.Chmod(dest, 0755)
 	}
 	logMessage("meshcentral agent downloaded to " + dest)
-	return nil
+	return dest, nil
 }
 
 func ensureMCAgentRunning(bin string, cfg *mcConfigData) {
-	if mcAgentProcess != nil {
-		if err := mcAgentProcess.Signal(syscall.Signal(0)); err == nil {
-			return
-		}
-		mcAgentProcess = nil
+	if isMCAgentAlive() {
+		return
 	}
 
-	mshContent := fmt.Sprintf("MeshServer=%s\nMeshID=%s\n", cfg.ServerURL, cfg.AgentGroup)
+	mcURL := strings.TrimRight(cfg.ServerURL, "/")
+	wssURL := strings.Replace(mcURL, "https://", "wss://", 1)
+	wssURL = strings.Replace(wssURL, "http://", "ws://", 1)
+
+	mshContent := fmt.Sprintf("MeshServer=%s\nMeshID=%s\n", wssURL, cfg.AgentGroup)
 	mshPath := bin + ".msh"
 	os.WriteFile(mshPath, []byte(mshContent), 0600)
+	logMessage("meshcentral .msh file written: " + mshPath)
+	logMessage("meshcentral .msh content: MeshServer=" + wssURL + " MeshID=" + cfg.AgentGroup)
 
-	args := []string{"-url", cfg.ServerURL}
-	if cfg.AgentGroup != "" {
-		args = append(args, "-meshid", cfg.AgentGroup)
-	}
-	args = append(args, "-mshfile", mshPath)
-
-	cmd := exec.Command(bin, args...)
+	cmd := exec.Command(bin, "--mshfile", mshPath)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -656,6 +688,7 @@ func ensureMCAgentRunning(bin string, cfg *mcConfigData) {
 		return
 	}
 	mcAgentProcess = cmd.Process
+	mcAgentPID = cmd.Process.Pid
 	logMessage("meshcentral agent started (pid=" + fmt.Sprint(cmd.Process.Pid) + ")")
 
 	go cmd.Wait()
@@ -663,8 +696,13 @@ func ensureMCAgentRunning(bin string, cfg *mcConfigData) {
 
 func stopMCAgent() {
 	if mcAgentProcess != nil {
-		mcAgentProcess.Kill()
+		if runtime.GOOS == "windows" {
+			exec.Command("taskkill", "/F", "/PID", strconv.Itoa(mcAgentPID)).Run()
+		} else {
+			mcAgentProcess.Kill()
+		}
 		mcAgentProcess = nil
+		mcAgentPID = 0
 		logMessage("meshcentral agent stopped")
 	}
 }
