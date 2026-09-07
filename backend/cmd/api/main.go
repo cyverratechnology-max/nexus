@@ -82,7 +82,13 @@ type commandResult struct {
 	FileSize    *int64         `json:"file_size,omitempty"`
 }
 type remoteSessionRequest struct {
-	Protocol string `json:"protocol"`
+	Protocol   string `json:"protocol"`
+	RDPHost    string `json:"rdp_host"`
+	RDPPort    int    `json:"rdp_port"`
+	RDPUser    string `json:"rdp_username"`
+	RDPPass    string `json:"rdp_password"`
+	VNCPort    int    `json:"vnc_port"`
+	VNCPass    string `json:"vnc_password"`
 }
 
 func main() {
@@ -131,6 +137,7 @@ func main() {
 	mux.HandleFunc("POST /api/v1/devices/{id}/remote-sessions", s.requireUser(s.createRemoteSession))
 	mux.HandleFunc("GET /api/v1/devices/{id}/remote-sessions", s.requireUser(s.listRemoteSessions))
 	mux.HandleFunc("POST /api/v1/remote-sessions/{id}/close", s.requireUser(s.closeRemoteSession))
+	mux.HandleFunc("POST /api/v1/agent/remote-sessions/{id}/status", s.agentRemoteSessionStatus)
 	mux.HandleFunc("GET /api/v1/audit-logs", s.requireUser(s.listAuditLogs))
 	handler := s.cors(s.requestID(mux))
 	addr := env("API_ADDR", ":8443")
@@ -723,18 +730,38 @@ func (s *server) createRemoteSession(w http.ResponseWriter, r *http.Request) {
 	if !decode(r, &req) {
 		req.Protocol = "WEBRTC"
 	}
-	if req.Protocol != "WEBRTC" {
-		writeError(w, 400, "only WEBRTC sessions are supported")
+	validProtocols := map[string]bool{"WEBRTC": true, "VNC": true, "RDP": true}
+	if !validProtocols[req.Protocol] {
+		writeError(w, 400, "protocol must be WEBRTC, VNC, or RDP")
 		return
 	}
-	var id string
-	err := s.db.QueryRow(r.Context(), `INSERT INTO remote_sessions (organization_id,device_id,user_id,protocol,stun_url,turn_url) SELECT $1,id,$2,$3,$4,$5 FROM devices WHERE id=$6 AND organization_id=$1 AND status <> 'RETIRED' RETURNING id`, a.OrganizationID, a.UserID, req.Protocol, os.Getenv("STUN_URL"), os.Getenv("TURN_URL"), r.PathValue("id")).Scan(&id)
+	if req.Protocol == "RDP" && req.RDPPort == 0 {
+		req.RDPPort = 3389
+	}
+	if req.Protocol == "VNC" && req.VNCPort == 0 {
+		req.VNCPort = 5900
+	}
+	var id, deviceIP string
+	err := s.db.QueryRow(r.Context(), `INSERT INTO remote_sessions (organization_id,device_id,user_id,protocol,stun_url,turn_url,rdp_port,rdp_username,rdp_password,vnc_port,vnc_password) SELECT $1,id,$2,$3,$4,$5,$6,$7,$8,$9,$10 FROM devices WHERE id=$11 AND organization_id=$1 AND status <> 'RETIRED' RETURNING id`,
+		a.OrganizationID, a.UserID, req.Protocol, os.Getenv("STUN_URL"), os.Getenv("TURN_URL"),
+		req.RDPPort, req.RDPUser, req.RDPPass, req.VNCPort, req.VNCPass, r.PathValue("id")).Scan(&id)
 	if err != nil {
 		writeError(w, 404, "device not found")
 		return
 	}
-	_, _ = s.db.Exec(r.Context(), `INSERT INTO audit_logs (organization_id,user_id,device_id,action,resource,metadata) VALUES ($1,$2,$3,'remote.session.requested','remote_session',jsonb_build_object('session_id',$4))`, a.OrganizationID, a.UserID, r.PathValue("id"), id)
-	writeJSON(w, 202, map[string]any{"session_id": id, "status": "REQUESTED", "protocol": req.Protocol, "expires_in_seconds": 1800})
+	_ = s.db.QueryRow(r.Context(), `SELECT COALESCE(ip_address::text, '') FROM devices WHERE id=$1`, r.PathValue("id")).Scan(&deviceIP)
+	_, _ = s.db.Exec(r.Context(), `INSERT INTO audit_logs (organization_id,user_id,device_id,action,resource,metadata) VALUES ($1,$2,$3,'remote.session.requested','remote_session',jsonb_build_object('session_id',$4,'protocol',$5))`, a.OrganizationID, a.UserID, r.PathValue("id"), id, req.Protocol)
+
+	resp := map[string]any{"session_id": id, "status": "REQUESTED", "protocol": req.Protocol, "expires_in_seconds": 1800}
+	if req.Protocol == "RDP" {
+		resp["host"] = deviceIP
+		resp["port"] = req.RDPPort
+		resp["username"] = req.RDPUser
+	} else if req.Protocol == "VNC" {
+		resp["host"] = deviceIP
+		resp["port"] = req.VNCPort
+	}
+	writeJSON(w, 202, resp)
 }
 func (s *server) listRemoteSessions(w http.ResponseWriter, r *http.Request) {
 	a := r.Context().Value(authContextKey).(auth)
@@ -780,6 +807,31 @@ func (s *server) closeRemoteSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]string{"status": "CLOSED"})
+}
+func (s *server) agentRemoteSessionStatus(w http.ResponseWriter, r *http.Request) {
+	credential := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	var deviceID string
+	if err := s.db.QueryRow(r.Context(), "SELECT id FROM devices WHERE credential_hash=$1", hash(credential)).Scan(&deviceID); err != nil {
+		writeError(w, 401, "invalid device credential")
+		return
+	}
+	var req struct {
+		Status        string `json:"status"`
+		ConnectionURL string `json:"connection_url"`
+		RelayToken    string `json:"relay_token"`
+	}
+	if !decode(r, &req) {
+		writeError(w, 400, "invalid request")
+		return
+	}
+	sessionID := r.PathValue("id")
+	result, err := s.db.Exec(r.Context(), `UPDATE remote_sessions SET status=$1, connection_url=COALESCE(NULLIF($2,''),connection_url), relay_token=COALESCE(NULLIF($3,''),relay_token), started_at=CASE WHEN $1='ACTIVE' THEN now() ELSE started_at END WHERE id=$4 AND device_id=$5`,
+		req.Status, req.ConnectionURL, req.RelayToken, sessionID, deviceID)
+	if err != nil || result.RowsAffected() != 1 {
+		writeError(w, 404, "session not found")
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "accepted"})
 }
 func (s *server) listAuditLogs(w http.ResponseWriter, r *http.Request) {
 	a := r.Context().Value(authContextKey).(auth)

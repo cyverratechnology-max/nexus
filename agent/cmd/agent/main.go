@@ -100,6 +100,7 @@ func main() {
 	sendInventory(cfg)
 	sendMetrics(cfg)
 	pollCommands(cfg)
+	pollRemoteSessions(cfg)
 	if *once {
 		return
 	}
@@ -113,6 +114,7 @@ func main() {
 		sendInventory(cfg)
 		sendMetrics(cfg)
 		pollCommands(cfg)
+		pollRemoteSessions(cfg)
 	}
 }
 
@@ -226,6 +228,69 @@ func pollCommands(cfg config) {
 	if result != nil {
 		_ = post(cfg.API+"/api/v1/agent/commands/"+job.ID+"/result", cfg.Credential, result, &map[string]any{})
 	}
+}
+
+type remoteSessionJob struct {
+	ID       string `json:"id"`
+	Protocol string `json:"protocol"`
+	Status   string `json:"status"`
+}
+
+func pollRemoteSessions(cfg config) {
+	var job remoteSessionJob
+	if err := get(cfg.API+"/api/v1/agent/remote-sessions", cfg.Credential, &job); err != nil || job.ID == "" {
+		return
+	}
+	report := map[string]string{"status": "ACTIVE"}
+	if job.Protocol == "RDP" {
+		port := getRDPPort()
+		report["connection_url"] = fmt.Sprintf("rdp://%s:%d", getLocalIP(), port)
+	} else if job.Protocol == "VNC" {
+		port := getVNCPort()
+		report["connection_url"] = fmt.Sprintf("vnc://%s:%d", getLocalIP(), port)
+	}
+	_ = post(cfg.API+"/api/v1/agent/remote-sessions/"+job.ID+"/status", cfg.Credential, report, &map[string]any{})
+}
+
+func getRDPPort() int {
+	if runtime.GOOS == "windows" {
+		out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", "(Get-ItemProperty 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server\\WinStations\\RDP-Tcp' -Name PortNumber).PortNumber").Output()
+		if err == nil {
+			port := 0
+			fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &port)
+			if port > 0 {
+				return port
+			}
+		}
+	}
+	return 3389
+}
+
+func getVNCPort() int {
+	if runtime.GOOS == "linux" {
+		out, err := exec.Command("sh", "-c", "ss -tlnp | grep -i vnc | head -1 | awk '{print $4}' | rev | cut -d: -f1 | rev").Output()
+		if err == nil {
+			port := 0
+			fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &port)
+			if port > 0 {
+				return port
+			}
+		}
+	}
+	return 5900
+}
+
+func getLocalIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "127.0.0.1"
+	}
+	for _, addr := range addrs {
+		if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() && ipNet.IP.To4() != nil {
+			return ipNet.IP.String()
+		}
+	}
+	return "127.0.0.1"
 }
 
 func executeRMMJob(cfg config, job commandJob) *commandResult {

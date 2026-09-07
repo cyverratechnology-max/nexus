@@ -385,6 +385,7 @@ function RemoteDesktopPage({ devices, selected }: any) {
   const [tool, setTool] = useState<'remote' | 'chat' | 'sysinfo' | 'wol' | 'shutdown' | 'sysmgr' | 'announce'>('remote')
   const [tab, setTab] = useState<'computers' | 'history' | 'settings' | 'recording' | 'performance' | 'confirmation'>('computers')
   const [viewer, setViewer] = useState<'html5' | 'activex'>('html5')
+  const [protocol, setProtocol] = useState<'WEBRTC' | 'VNC' | 'RDP'>('WEBRTC')
   const [filterPlatform, setFilterPlatform] = useState('all')
   const [filterStatus, setFilterStatus] = useState('all')
   const [search, setSearch] = useState('')
@@ -392,6 +393,10 @@ function RemoteDesktopPage({ devices, selected }: any) {
   const [session, setSession] = useState<any>(null)
   const [msg, setMsg] = useState('')
   const [page, setPage] = useState(1)
+  const [connectDevice, setConnectDevice] = useState<string | null>(null)
+  const [rdpUser, setRdpUser] = useState('')
+  const [rdpPass, setRdpPass] = useState('')
+  const [vncPass, setVncPass] = useState('')
   const perPage = 25
 
   const onlineDevices = devices.filter((d: Device) => d.status === 'ONLINE')
@@ -417,15 +422,28 @@ function RemoteDesktopPage({ devices, selected }: any) {
   }, [tab, devices])
 
   const connect = async (deviceId: string) => {
-    const r = await fetch(`${API}/api/v1/devices/${deviceId}/remote-sessions`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ protocol: 'WEBRTC' }) })
+    const body: Record<string, unknown> = { protocol }
+    if (protocol === 'RDP') { body.rdp_username = rdpUser; body.rdp_password = rdpPass; body.rdp_port = 3389 }
+    if (protocol === 'VNC') { body.vnc_password = vncPass; body.vnc_port = 5900 }
+    const r = await fetch(`${API}/api/v1/devices/${deviceId}/remote-sessions`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
     const b = await r.json()
-    if (r.ok) { setSession(b); setMsg(`Connected to ${devices.find((d: Device) => d.id === deviceId)?.hostname}. WebRTC capture agent required.`) }
-    else setMsg(b.error?.message ?? 'Connection failed')
+    if (r.ok) {
+      setSession({ ...b, device_id: deviceId })
+      const host = devices.find((d: Device) => d.id === deviceId)?.hostname
+      if (protocol === 'WEBRTC') setMsg(`Connected to ${host}. WebRTC capture agent required.`)
+      else if (protocol === 'RDP') setMsg(`RDP session ready. Connect via ${b.host || 'device IP'}:${b.port || 3389}`)
+      else setMsg(`VNC session ready. Connect via ${b.host || 'device IP'}:${b.port || 5900}`)
+      setConnectDevice(null)
+    } else setMsg(b.error?.message ?? 'Connection failed')
   }
   const closeSession = async () => {
     if (!session) return
     await fetch(`${API}/api/v1/remote-sessions/${session.session_id}/close`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: 'operator closed' }) })
     setSession(null); setMsg('Session closed')
+  }
+  const openConnectDialog = (deviceId: string) => {
+    if (protocol === 'WEBRTC') { connect(deviceId); return }
+    setConnectDevice(deviceId); setRdpUser(''); setRdpPass(''); setVncPass('')
   }
 
   const toolItems = [
@@ -447,6 +465,8 @@ function RemoteDesktopPage({ devices, selected }: any) {
     { key: 'confirmation' as const, label: 'User Confirmation' },
   ]
 
+  const connectDeviceName = connectDevice ? devices.find((d: Device) => d.id === connectDevice)?.hostname : ''
+
   return (
     <div className="rdp-layout">
       <div className="rdp-sidebar">
@@ -462,8 +482,8 @@ function RemoteDesktopPage({ devices, selected }: any) {
         {tool === 'remote' && (
           <>
             <div className="rdp-info-bar">
-              <p>Remote Control helps you to gain access to remote computer. This requires Cyverra Agent to be installed in client systems. Enable WebRTC controls from where a connection to the client systems is being established.</p>
-              <a href="#">Prerequisites for Remote Control</a> | <a href="#">Need more Features?</a>
+              <p>Remote Control helps you to gain access to remote computer. This requires Cyverra Agent to be installed in client systems. Supports WebRTC, VNC, and RDP protocols.</p>
+              <a href="#">Prerequisites</a> | <a href="#">Need more Features?</a>
             </div>
             <div className="rdp-tabs">
               {tabs.map(t => <button key={t.key} className={tab === t.key ? 'active' : ''} onClick={() => setTab(t.key)}>{t.label}</button>)}
@@ -474,6 +494,12 @@ function RemoteDesktopPage({ devices, selected }: any) {
                   <div className="rdp-viewer-select">
                     <label><input type="radio" name="viewer" checked={viewer === 'html5'} onChange={() => setViewer('html5')} /> HTML5 Viewer</label>
                     <label><input type="radio" name="viewer" checked={viewer === 'activex'} onChange={() => setViewer('activex')} /> WebRTC</label>
+                  </div>
+                  <div className="rdp-protocol-select">
+                    <span className="rdp-proto-label">Protocol:</span>
+                    {(['WEBRTC', 'VNC', 'RDP'] as const).map(p => (
+                      <button key={p} className={`rdp-proto-btn ${protocol === p ? 'active' : ''}`} onClick={() => setProtocol(p)}>{p}</button>
+                    ))}
                   </div>
                   <div className="rdp-filters">
                     <select value={filterStatus} onChange={e => { setFilterStatus(e.target.value); setPage(1) }}>
@@ -515,7 +541,7 @@ function RemoteDesktopPage({ devices, selected }: any) {
                         {session?.device_id === d.id ? (
                           <button className="rdp-btn rdp-btn-disconnect" onClick={closeSession}>Disconnect</button>
                         ) : (
-                          <button className="rdp-btn rdp-btn-connect" onClick={() => connect(d.id)}>Connect</button>
+                          <button className="rdp-btn rdp-btn-connect" onClick={() => openConnectDialog(d.id)}>Connect</button>
                         )}
                       </span>
                       <span className="rdp-col-remarks">--</span>
@@ -570,6 +596,30 @@ function RemoteDesktopPage({ devices, selected }: any) {
         {tool === 'sysmgr' && <div className="rdp-content"><div className="rdp-placeholder"><h3>System Manager</h3><p>Process manager, service manager, and event viewer.</p></div></div>}
         {tool === 'announce' && <div className="rdp-content"><div className="rdp-placeholder"><h3>Announcement</h3><p>Broadcast messages to all or selected endpoints.</p></div></div>}
         {msg && <div className="rdp-toast">{msg}<button onClick={() => setMsg('')}>×</button></div>}
+        {connectDevice && (
+          <div className="rdp-modal-overlay" onClick={() => setConnectDevice(null)}>
+            <div className="rdp-modal" onClick={e => e.stopPropagation()}>
+              <div className="rdp-modal-head"><h3>Connect via {protocol}</h3><button onClick={() => setConnectDevice(null)}>×</button></div>
+              <div className="rdp-modal-body">
+                <p className="rdp-modal-info">Device: <strong>{connectDeviceName}</strong> · Protocol: <strong>{protocol}</strong></p>
+                {protocol === 'RDP' && (
+                  <>
+                    <label className="rdp-modal-field"><span>Username</span><input value={rdpUser} onChange={e => setRdpUser(e.target.value)} placeholder="Administrator" /></label>
+                    <label className="rdp-modal-field"><span>Password</span><input type="password" value={rdpPass} onChange={e => setRdpPass(e.target.value)} placeholder="Password" /></label>
+                  </>
+                )}
+                {protocol === 'VNC' && (
+                  <label className="rdp-modal-field"><span>VNC Password</span><input type="password" value={vncPass} onChange={e => setVncPass(e.target.value)} placeholder="VNC password" /></label>
+                )}
+                {protocol === 'WEBRTC' && <p className="rdp-modal-note">WebRTC requires the capture agent to be installed on the target device.</p>}
+              </div>
+              <div className="rdp-modal-foot">
+                <button className="rdp-btn rdp-btn-cancel" onClick={() => setConnectDevice(null)}>Cancel</button>
+                <button className="rdp-btn rdp-btn-connect" onClick={() => connect(connectDevice)}>Start Session</button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )
