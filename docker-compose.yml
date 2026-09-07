@@ -25,6 +25,8 @@ services:
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@cyverra.local}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}
       MIGRATIONS_DIR: /app/migrations
+    extra_hosts:
+      - "api.cyverratech.my.id:host-gateway"
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:
