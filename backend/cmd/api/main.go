@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -1138,48 +1139,73 @@ func (s *server) syncMeshCentralDevices(w http.ResponseWriter, r *http.Request) 
 }
 
 func fetchMeshCentralDevices(serverURL, apiKey string) ([]map[string]any, error) {
-	url := strings.TrimRight(serverURL, "/") + "/api/devices?apikey=" + apiKey
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get(url)
+	meshListURL := strings.TrimRight(serverURL, "/") + "/meshsettings?apikey=" + apiKey
+	client := &http.Client{Timeout: 15 * time.Second, Transport: &http.Transport{TLSClientConfig: skipTLSVerify()}}
+	resp, err := client.Get(meshListURL)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+
+	var meshResp struct {
+		Meshes []struct {
+			ID   string `json:"_id"`
+			Name string `json:"name"`
+		} `json:"meshes"`
 	}
-	var apiResp struct {
-		Results []struct {
-			ID           int    `json:"id"`
-			Name         string `json:"name"`
-			Host         string `json:"host"`
-			IP           string `json:"ip"`
-			Domain       string `json:"domain"`
-			AgentVersion int    `json:"agentVersion"`
-			Platform     int    `json:"platform"`
-			State        int    `json:"state"`
-			MeshID       string `json:"meshid"`
-		} `json:"results"`
+	if err := json.Unmarshal(body, &meshResp); err != nil {
+		return nil, fmt.Errorf("parse error: %v body: %s", err, string(body[:min(len(body), 200)]))
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
-		return nil, err
-	}
-	devices := make([]map[string]any, 0, len(apiResp.Results))
-	for _, d := range apiResp.Results {
-		platformStr := "unknown"
-		switch d.Platform {
-		case 1: platformStr = "windows"
-		case 2: platformStr = "linux"
-		case 3: platformStr = "macos"
+
+	devices := []map[string]any{}
+	for _, mesh := range meshResp.Meshes {
+		nodeURL := strings.TrimRight(serverURL, "/") + "/meshsettings?apikey=" + apiKey + "&id=" + mesh.ID
+		nodeResp, err := client.Get(nodeURL)
+		if err != nil {
+			continue
 		}
-		devices = append(devices, map[string]any{
-			"id": d.ID, "name": d.Name, "host": d.Host, "ip": d.IP,
-			"domain": d.Domain, "agentVersion": d.AgentVersion,
-			"platform": platformStr, "state": d.State, "meshId": d.MeshID,
-		})
+		nodeBody, _ := io.ReadAll(io.LimitReader(nodeResp.Body, 1<<20))
+		nodeResp.Body.Close()
+
+		var nodes struct {
+			Nodes []struct {
+				ID           string `json:"_id"`
+				Name         string `json:"name"`
+				Host         string `json:"host"`
+				IP           string `json:"ip"`
+				AgentVersion int    `json:"agentVer"`
+				Platform     int    `json:"platform"`
+				State        int    `json:"state"`
+			} `json:"nodes"`
+		}
+		if err := json.Unmarshal(nodeBody, &nodes); err != nil {
+			continue
+		}
+		for _, n := range nodes.Nodes {
+			platformStr := "unknown"
+			switch n.Platform {
+			case 1: platformStr = "windows"
+			case 2: platformStr = "linux"
+			case 3: platformStr = "macos"
+			}
+			devices = append(devices, map[string]any{
+				"id": n.ID, "name": n.Name, "host": n.Host, "ip": n.IP,
+				"domain": "", "agentVersion": n.AgentVersion,
+				"platform": platformStr, "state": n.State, "meshId": mesh.ID,
+			})
+		}
 	}
 	return devices, nil
+}
+
+func min(a, b int) int {
+	if a < b { return a }
+	return b
+}
+
+func skipTLSVerify() *tls.Config {
+	return &tls.Config{InsecureSkipVerify: true}
 }
 
 func (s *server) meshCentralProxy(w http.ResponseWriter, r *http.Request) {
@@ -1211,7 +1237,7 @@ func (s *server) meshCentralProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	proxyReq.Header.Set("Content-Type", r.Header.Get("Content-Type"))
 	proxyReq.Header.Set("Accept", r.Header.Get("Accept"))
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{TLSClientConfig: skipTLSVerify()}}
 	proxyResp, err := client.Do(proxyReq)
 	if err != nil {
 		writeError(w, 502, "MeshCentral unreachable")
